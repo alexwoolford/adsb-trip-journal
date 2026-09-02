@@ -1,0 +1,25 @@
+[Unit]
+Description=ADS-B trip journal OpenSky watch (fleet /states/all)
+Documentation=file:///opt/adsb-trip-journal/docs/DAILY_OPS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adsb
+Group=adsb
+Nice=10
+EnvironmentFile=-/opt/adsb-trip-journal/etc/adsb-trip-journal.env
+WorkingDirectory=/opt/adsb-trip-journal
+ExecStart=/opt/adsb-trip-journal/scripts/run-watch.sh
+Restart=on-failure
+RestartSec=30
+SyslogIdentifier=adsb-trip-journal-watch
+ReadWritePaths=/var/lib/adsb-trip-journal
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

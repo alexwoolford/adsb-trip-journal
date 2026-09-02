@@ -1,0 +1,12 @@
+[Unit]
+Description=ADS-B trip journal OpenSky collect timer
+Documentation=file:///opt/adsb-trip-journal/docs/DAILY_OPS.md
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+Unit=adsb-trip-journal-collect.service
+
+[Install]
+WantedBy=timers.target

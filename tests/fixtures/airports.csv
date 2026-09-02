@@ -1,0 +1,6 @@
+ident,type,latitude_deg,longitude_deg,name
+KAPA,large_airport,39.5701,-104.6737,Centennial
+KJFK,large_airport,40.6399,-73.7787,John F Kennedy Intl
+CO99,small_airport,39.5750,-104.6700,Nearby small
+HEL1,heliport,39.5710,-104.6740,Pad
+FAR,small_airport,0.0,0.0,Null Island

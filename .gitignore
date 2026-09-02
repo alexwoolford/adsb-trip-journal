@@ -1,0 +1,43 @@
+# Build and binaries
+/target
+/adsb-trip-journal
+*.so
+*.dylib
+*.exe
+*.rlib
+
+# Generated journal, probes, and downloads (keep directory placeholders)
+/data/*
+!/data/.gitkeep
+/cache/*
+!/cache/.gitkeep
+
+# Leftover after systemd templates moved to deploy/
+/ops/
+
+# Internal host handoff (SSH aliases, co-tenant services, sudo). Keep local; do not publish.
+/context/tail-to-ticker-host-deploy-spec.md
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+secrets/
+
+# Feed formats anywhere they show up
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.parquet
+*.db
+
+# Editor / OS
+.cursor/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~

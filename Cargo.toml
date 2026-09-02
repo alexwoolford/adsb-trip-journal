@@ -1,0 +1,36 @@
+[package]
+name = "adsb-trip-journal"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Restartable trip journal for mapped corporate tails (ADS-B Exchange traces + OpenSky REST)"
+rust-version = "1.80"
+
+[lib]
+name = "adsb_trip_journal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adsb-trip-journal"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+csv = "1"
+dotenvy = "0.15"
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }

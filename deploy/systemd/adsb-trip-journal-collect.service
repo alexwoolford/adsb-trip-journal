@@ -1,0 +1,21 @@
+[Unit]
+Description=ADS-B trip journal OpenSky collect (yesterday UTC)
+Documentation=file:///opt/adsb-trip-journal/docs/DAILY_OPS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=adsb
+Group=adsb
+Nice=10
+EnvironmentFile=-/opt/adsb-trip-journal/etc/adsb-trip-journal.env
+WorkingDirectory=/opt/adsb-trip-journal
+ExecStart=/opt/adsb-trip-journal/scripts/run-collect.sh
+TimeoutStartSec=2h
+SyslogIdentifier=adsb-trip-journal-collect
+ReadWritePaths=/var/lib/adsb-trip-journal
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
