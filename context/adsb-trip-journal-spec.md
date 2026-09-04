@@ -118,7 +118,8 @@ CREATE TABLE fleet_snapshot (
   model TEXT,
   aviation_issuer INTEGER NOT NULL,
   fleet_size INTEGER NOT NULL,
-  snapshot_as_of TEXT NOT NULL  -- ISO date of the mapping file used
+  snapshot_as_of TEXT NOT NULL, -- map as_of_date, UTC date YYYY-MM-DD
+  recorded_at TEXT NOT NULL     -- write time YYYY-MM-DDTHH:MM:SSZ; same on every row of one replace
 );
 ```
 
@@ -129,8 +130,8 @@ One row per **completed leg**. Identity is hex + departure timestamp (stable if 
 ```sql
 CREATE TABLE trips (
   icao24 TEXT NOT NULL,
-  dep_ts TEXT NOT NULL,          -- UTC ISO-8601
-  arr_ts TEXT,                   -- UTC; null if still open at end of day (rare)
+  dep_ts TEXT NOT NULL,          -- UTC instant YYYY-MM-DDTHH:MM:SSZ
+  arr_ts TEXT,                   -- same; null if still open at end of day (rare)
   n_number TEXT NOT NULL,
   ticker TEXT NOT NULL,
   cik TEXT,
@@ -143,7 +144,7 @@ CREATE TABLE trips (
   dep_place TEXT,                -- ident or "lat,lon" for display
   arr_place TEXT,
   source TEXT NOT NULL,          -- adsbx_trace_hist | adsbx_trace_recent | adsbx_live
-  fetched_at TEXT NOT NULL,
+  fetched_at TEXT NOT NULL,      -- UTC instant YYYY-MM-DDTHH:MM:SSZ
   PRIMARY KEY (icao24, dep_ts)
 );
 CREATE INDEX idx_trips_ticker_dep ON trips (ticker, dep_ts);
@@ -159,13 +160,31 @@ Restartable backfill / increment.
 ```sql
 CREATE TABLE fetch_cursor (
   icao24 TEXT PRIMARY KEY,
-  last_ok_date TEXT,             -- last UTC date with a successful fetch (incl. 404 = no trace)
+  last_ok_date TEXT,             -- last UTC date YYYY-MM-DD with a successful fetch (incl. 404 = no trace)
   last_error TEXT,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL       -- UTC instant YYYY-MM-DDTHH:MM:SSZ
 );
 ```
 
 A successful **404** (no trace that day) still advances `last_ok_date`. HTTP 401/402/403/429 must **not** advance the cursor.
+
+OpenSky daily collect is **not** per-hex `/flights/aircraft`. It runs twelve `GET /flights/all` 2-hour slices, filters to the mapped fleet, and marks the UTC day complete only after 12/12. Per-hex `last_ok_date` is advanced for the fleet when that day completes.
+
+### `flights_all_slice` / `flights_all_day`
+
+```sql
+CREATE TABLE flights_all_slice (
+  utc_date TEXT NOT NULL,        -- YYYY-MM-DD
+  slice_idx INTEGER NOT NULL,    -- 0..11
+  completed_at TEXT NOT NULL,    -- UTC instant YYYY-MM-DDTHH:MM:SSZ
+  PRIMARY KEY (utc_date, slice_idx)
+);
+CREATE TABLE flights_all_day (
+  utc_date TEXT PRIMARY KEY,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+```
 
 ---
 
@@ -246,7 +265,7 @@ v1 is done when all of the following are true:
 
 1. Sibling repo (or local tree) reads mapping SQLite **read-only** via `TAIL_TO_TICKER_SQLITE`.
 2. Fleet query in §3 is the default input; empty `icao24` rows are skipped and counted.
-3. For every hex in that fleet, `fetch_cursor.last_ok_date` covers every UTC day in the attempted window (including documented 404s).
+3. For OpenSky collect, `flights_all_slice` has 12/12 rows for every UTC day in the attempted window (401/429 do not mark remaining slices). Per-hex `fetch_cursor.last_ok_date` is advanced for the fleet when that day completes. ADSBX collect still uses per-hex `last_ok_date` (including documented 404s).
 4. `trips` contains one row per segmented completed leg with `dep_ts`, coordinates, and airport snap when in radius.
 5. Re-running a day is idempotent (`PRIMARY KEY (icao24, dep_ts)`).
 6. Mapping SQLite file size and `mappings_current` row count are unchanged after a sibling run.

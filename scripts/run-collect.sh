@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Oneshot: collect yesterday UTC for hexes in seen_airborne.
-# Empty watch list skips (exit 0); does not fall back to the full fleet.
+# Oneshot: collect yesterday UTC via 12× GET /flights/all (filter mapped fleet).
+# Incomplete slice days resume. Not gated on seen_airborne.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${ADSB_TRIP_JOURNAL_BIN:-$ROOT/bin/adsb-trip-journal}"
 STATE="${TRIP_JOURNAL_DATA:-/var/lib/adsb-trip-journal}"
-MAPPING="${TAIL_TO_TICKER_SQLITE:-$STATE/mapping/tail_to_ticker.sqlite}"
+MAPPING="${TAIL_TO_TICKER_SQLITE:-/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite}"
 JOURNAL="${TRIP_JOURNAL_SQLITE:-$STATE/trips.sqlite}"
 CACHE="${TRIP_JOURNAL_CACHE:-$STATE/cache}"
 LOCK="${ADSB_COLLECT_LOCK:-$STATE/.collect.lock}"
-MAX_CREDITS="${OPENSKY_MAX_FLIGHTS_CREDITS:-3500}"
+MAX_CREDITS="${OPENSKY_MAX_FLIGHTS_CREDITS:-500}"
 
 test -x "$BIN" || {
   echo "missing $BIN — build with: cargo build --release" >&2

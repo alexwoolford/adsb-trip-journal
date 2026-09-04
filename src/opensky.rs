@@ -1,5 +1,6 @@
 //! OpenSky Network REST API: OAuth2 client, states / flights / tracks.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -23,12 +24,41 @@ const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(30);
 /// Live lookback may still be 4; yesterday’s batch has billed **30** in this account.
 pub const FLIGHTS_CALL_CREDITS: u32 = 30;
 pub const TRACKS_CALL_CREDITS: u32 = 4;
-pub const STATES_CALL_CREDITS: u32 = 1;
-/// Full-fleet yesterday at 30/call exceeds the 4,000 bucket. Require watch or `--hex`.
+/// Observed `/states/all?icao24=…` cost (hex filter, not serial-only).
+/// Serial-only `/states/all` is 1; icao24/bbox billed **4** on this account
+/// (2026-09-02 watch: 5 chunks of 80 → remaining dropped 20/poll).
+pub const STATES_CALL_CREDITS: u32 = 4;
+/// Full-fleet yesterday at 30/call exceeds the 4,000 bucket. Per-hex collect cannot scale.
 pub fn full_fleet_fallback_allowed() -> bool {
     FLIGHTS_CALL_CREDITS < 30
 }
-const HEX_CHUNK: usize = 80;
+pub const HEX_CHUNK: usize = 80;
+/// `/flights/all` max window. Twelve adjacent slices cover one UTC day.
+pub const FLIGHTS_ALL_SLICES_PER_DAY: u32 = 12;
+pub const FLIGHTS_ALL_SLICE_SECS: i64 = 7_200;
+/// Measured `/flights/all` 2h historical slice: **30** flights-credits
+/// (2026-09-03 12:00–14:00 UTC; HTTP 200, remaining consistent with 30 after
+/// that day's `/flights/aircraft` collect). Docs' "Live / < 24 h → 4" does not apply.
+pub const FLIGHTS_ALL_SLICE_CREDITS: u32 = 30;
+const STATES_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const FLIGHTS_ALL_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+/// How far back default collect looks for trip/watch days that were never
+/// covered by `/flights/all`. Incomplete slice rows always resume, even older.
+pub const FLIGHTS_ALL_LOOKBACK_DAYS: u64 = 14;
+
+/// How many `/states/all` requests a fleet of `n_hexes` needs at [`HEX_CHUNK`].
+pub fn states_request_count(n_hexes: usize) -> u32 {
+    if n_hexes == 0 {
+        0
+    } else {
+        n_hexes.div_ceil(HEX_CHUNK) as u32
+    }
+}
+
+/// Estimated states-bucket spend for one watch poll of `n_hexes`.
+pub fn estimated_states_credits(n_hexes: usize) -> u32 {
+    states_request_count(n_hexes).saturating_mul(STATES_CALL_CREDITS)
+}
 
 #[derive(Debug, Clone)]
 pub struct OpenskyConfig {
@@ -96,6 +126,7 @@ struct CachedToken {
 
 pub struct OpenskyClient {
     http: reqwest::Client,
+    http_long: reqwest::Client,
     cfg: OpenskyConfig,
     token: Mutex<Option<CachedToken>>,
 }
@@ -190,15 +221,56 @@ pub struct OpenskyProbeReport {
     pub note: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenskyFlightsAllProbeReport {
+    pub date: String,
+    pub start_hour: u32,
+    pub token_ok: bool,
+    pub flights_status: Option<u16>,
+    pub flights_remaining: Option<u32>,
+    pub flights_remaining_before: Option<u32>,
+    pub flights_credits_spent: Option<u32>,
+    pub flights_begin: Option<i64>,
+    pub flights_end: Option<i64>,
+    pub flights_window: String,
+    pub body_bytes: usize,
+    pub elapsed_ms: u128,
+    pub raw_count: usize,
+    pub fleet_count: usize,
+    pub fleet_hexes: usize,
+    pub journal_trips_in_window: usize,
+    pub matched_keys: usize,
+    pub extra_vs_journal: usize,
+    pub missing_from_journal: usize,
+    pub abort: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FlightsAllOverlap {
+    pub fleet_count: usize,
+    pub fleet_hexes: usize,
+    pub journal_trips_in_window: usize,
+    pub matched_keys: usize,
+    pub extra_vs_journal: usize,
+    pub missing_from_journal: usize,
+}
+
 impl OpenskyClient {
     pub fn new(cfg: OpenskyConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent("adsb-trip-journal/0.1 (OpenSky REST)")
-            .timeout(Duration::from_secs(60))
+            .timeout(STATES_HTTP_TIMEOUT)
             .build()
             .context("build OpenSky HTTP client")?;
+        let http_long = reqwest::Client::builder()
+            .user_agent("adsb-trip-journal/0.1 (OpenSky REST)")
+            .timeout(FLIGHTS_ALL_HTTP_TIMEOUT)
+            .build()
+            .context("build OpenSky long-timeout HTTP client")?;
         Ok(Self {
             http,
+            http_long,
             cfg,
             token: Mutex::new(None),
         })
@@ -245,11 +317,27 @@ impl OpenskyClient {
     async fn authed_get(
         &self,
         url: reqwest::Url,
+        bucket: CreditBucket,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        self.authed_get_on(&self.http, url, bucket).await
+    }
+
+    async fn authed_get_long(
+        &self,
+        url: reqwest::Url,
+        bucket: CreditBucket,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        self.authed_get_on(&self.http_long, url, bucket).await
+    }
+
+    async fn authed_get_on(
+        &self,
+        http: &reqwest::Client,
+        url: reqwest::Url,
         _bucket: CreditBucket,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
         let token = self.bearer().await?;
-        let resp = self
-            .http
+        let resp = http
             .get(url)
             .header(
                 reqwest::header::AUTHORIZATION,
@@ -354,6 +442,172 @@ impl OpenskyClient {
                 Ok(OpenskyOutcome::Other { status, message })
             }
         }
+    }
+
+    /// `GET /flights/all` for `[begin, end]` (must be ≤ 2 hours).
+    pub async fn flights_all(
+        &self,
+        begin: i64,
+        end: i64,
+    ) -> Result<(OpenskyOutcome<Vec<Flight>>, usize, u128)> {
+        anyhow::ensure!(end > begin, "flights/all end must be greater than begin");
+        anyhow::ensure!(
+            end - begin <= FLIGHTS_ALL_SLICE_SECS,
+            "flights/all window must be ≤ 2 hours"
+        );
+        let mut url = reqwest::Url::parse(&format!("{API_ROOT}/flights/all"))?;
+        url.query_pairs_mut()
+            .append_pair("begin", &begin.to_string())
+            .append_pair("end", &end.to_string());
+        let started = Instant::now();
+        let (status, headers, body) = match self.authed_get_long(url, CreditBucket::Flights).await {
+            Ok(t) => t,
+            Err(e) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                let timeout = e.to_string().to_ascii_lowercase().contains("timed out")
+                    || e.to_string().to_ascii_lowercase().contains("timeout");
+                let message = if timeout {
+                    format!("timeout after {elapsed_ms}ms: {e}")
+                } else {
+                    format!("transport: {e}")
+                };
+                return Ok((OpenskyOutcome::Other { status: 0, message }, 0, elapsed_ms));
+            }
+        };
+        let elapsed_ms = started.elapsed().as_millis();
+        let body_bytes = body.len();
+        let credit = credit_from_headers(&headers, CreditBucket::Flights);
+        let outcome = match classify(status, body, credit)? {
+            OpenskyOutcome::Ok { data, credit } => match parse_flights(&data) {
+                Ok(flights) => OpenskyOutcome::Ok {
+                    data: flights,
+                    credit,
+                },
+                Err(e) => OpenskyOutcome::Other {
+                    status: status.as_u16(),
+                    message: format!("unparseable flights/all body ({body_bytes} bytes): {e}"),
+                },
+            },
+            OpenskyOutcome::NotFound { credit } => OpenskyOutcome::NotFound { credit },
+            OpenskyOutcome::RateLimited { credit } => OpenskyOutcome::RateLimited { credit },
+            OpenskyOutcome::Denied { status, message } => {
+                OpenskyOutcome::Denied { status, message }
+            }
+            OpenskyOutcome::Other { status, message } => OpenskyOutcome::Other { status, message },
+        };
+        Ok((outcome, body_bytes, elapsed_ms))
+    }
+
+    pub async fn probe_flights_all(
+        &self,
+        date: NaiveDate,
+        start_hour: u32,
+        flights_remaining_before: Option<u32>,
+        fleet: &HashSet<String>,
+        journal_keys: &HashSet<(String, i64)>,
+    ) -> Result<OpenskyFlightsAllProbeReport> {
+        let (begin, end) = utc_hours_window(date, start_hour, 2);
+        let window = format!("2h from {start_hour:02}:00 UTC");
+        if let Err(e) = self.bearer().await {
+            return Ok(OpenskyFlightsAllProbeReport {
+                date: date.to_string(),
+                start_hour,
+                token_ok: false,
+                flights_status: None,
+                flights_remaining: None,
+                flights_remaining_before,
+                flights_credits_spent: None,
+                flights_begin: Some(begin),
+                flights_end: Some(end),
+                flights_window: window,
+                body_bytes: 0,
+                elapsed_ms: 0,
+                raw_count: 0,
+                fleet_count: 0,
+                fleet_hexes: 0,
+                journal_trips_in_window: journal_keys.len(),
+                matched_keys: 0,
+                extra_vs_journal: 0,
+                missing_from_journal: journal_keys.len(),
+                abort: true,
+                note: format!("token failed: {e}"),
+            });
+        }
+        let (outcome, body_bytes, elapsed_ms) = self.flights_all(begin, end).await?;
+        let mut abort = false;
+        let mut note = String::new();
+        let (flights_status, flights_remaining, flights) = match outcome {
+            OpenskyOutcome::Ok { data, credit } => (Some(200u16), credit.remaining, data),
+            OpenskyOutcome::NotFound { credit } => {
+                note.push_str("flights/all 404 (empty interval); ");
+                (Some(404), credit.remaining, Vec::new())
+            }
+            OpenskyOutcome::RateLimited { credit } => {
+                abort = true;
+                note.push_str("flights/all 429; ");
+                (Some(429), credit.remaining, Vec::new())
+            }
+            OpenskyOutcome::Denied { status, message } => {
+                abort = true;
+                note.push_str(&format!("flights/all {status} {message}; "));
+                (Some(status), None, Vec::new())
+            }
+            OpenskyOutcome::Other { status, message } => {
+                abort = true;
+                note.push_str(&format!("flights/all {status} {message}; "));
+                (Some(status), None, Vec::new())
+            }
+        };
+        let overlap = overlap_fleet_journal(&flights, fleet, journal_keys);
+        let flights_credits_spent = match (flights_remaining_before, flights_remaining) {
+            (Some(before), Some(after)) if before >= after => {
+                let delta = before - after;
+                // Ignore leftover remaining from a different probe/day.
+                if delta > 60 {
+                    None
+                } else {
+                    Some(delta)
+                }
+            }
+            _ => None,
+        };
+        if elapsed_ms >= FLIGHTS_ALL_HTTP_TIMEOUT.as_millis().saturating_sub(1_000)
+            && flights_status == Some(0)
+        {
+            abort = true;
+        }
+        if flights_credits_spent.is_none()
+            && flights_remaining_before.is_some()
+            && flights_remaining.is_some()
+        {
+            note.push_str("remaining_before ignored (stale or implausible delta); ");
+        }
+        if note.is_empty() {
+            note = if abort { "abort".into() } else { "ok".into() };
+        }
+        Ok(OpenskyFlightsAllProbeReport {
+            date: date.to_string(),
+            start_hour,
+            token_ok: true,
+            flights_status,
+            flights_remaining,
+            flights_remaining_before,
+            flights_credits_spent,
+            flights_begin: Some(begin),
+            flights_end: Some(end),
+            flights_window: window,
+            body_bytes,
+            elapsed_ms,
+            raw_count: flights.len(),
+            fleet_count: overlap.fleet_count,
+            fleet_hexes: overlap.fleet_hexes,
+            journal_trips_in_window: overlap.journal_trips_in_window,
+            matched_keys: overlap.matched_keys,
+            extra_vs_journal: overlap.extra_vs_journal,
+            missing_from_journal: overlap.missing_from_journal,
+            abort,
+            note,
+        })
     }
 
     pub async fn tracks(
@@ -553,6 +807,52 @@ pub fn utc_hours_window(date: NaiveDate, start_hour: u32, hours: u32) -> (i64, i
         .and_utc()
         .timestamp();
     (start, start + i64::from(hours) * 3_600 - 1)
+}
+
+/// Twelve adjacent 2-hour windows covering `[00:00:00, 23:59:59]` UTC.
+pub fn utc_day_two_hour_slices(date: NaiveDate) -> Vec<(i64, i64)> {
+    let (day_begin, day_end) = utc_day_window(date);
+    (0..FLIGHTS_ALL_SLICES_PER_DAY)
+        .map(|i| {
+            let begin = day_begin + i64::from(i) * FLIGHTS_ALL_SLICE_SECS;
+            let end = (begin + FLIGHTS_ALL_SLICE_SECS - 1).min(day_end);
+            (begin, end)
+        })
+        .collect()
+}
+
+pub fn filter_flights_to_fleet(flights: &[Flight], fleet: &HashSet<String>) -> Vec<Flight> {
+    flights
+        .iter()
+        .filter(|f| fleet.contains(&f.icao24))
+        .cloned()
+        .collect()
+}
+
+pub fn overlap_fleet_journal(
+    flights: &[Flight],
+    fleet: &HashSet<String>,
+    journal_keys: &HashSet<(String, i64)>,
+) -> FlightsAllOverlap {
+    let fleet_flights = filter_flights_to_fleet(flights, fleet);
+    let api_keys: HashSet<(String, i64)> = fleet_flights
+        .iter()
+        .map(|f| (f.icao24.clone(), f.first_seen))
+        .collect();
+    let matched = api_keys.intersection(journal_keys).count();
+    let fleet_hexes = fleet_flights
+        .iter()
+        .map(|f| f.icao24.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    FlightsAllOverlap {
+        fleet_count: fleet_flights.len(),
+        fleet_hexes,
+        journal_trips_in_window: journal_keys.len(),
+        matched_keys: matched,
+        extra_vs_journal: api_keys.difference(journal_keys).count(),
+        missing_from_journal: journal_keys.difference(&api_keys).count(),
+    }
 }
 
 pub fn parse_flights(bytes: &[u8]) -> Result<Vec<Flight>> {
@@ -755,9 +1055,59 @@ mod tests {
     }
 
     #[test]
+    fn twelve_slices_cover_utc_day_without_gaps() {
+        let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let (day_b, day_e) = utc_day_window(d);
+        let slices = utc_day_two_hour_slices(d);
+        assert_eq!(slices.len(), 12);
+        assert_eq!(slices[0].0, day_b);
+        assert_eq!(slices[11].1, day_e);
+        for i in 1..12 {
+            assert_eq!(slices[i].0, slices[i - 1].1 + 1);
+        }
+        for (b, e) in &slices {
+            assert_eq!(*e - *b, FLIGHTS_ALL_SLICE_SECS - 1);
+        }
+    }
+
+    #[test]
+    fn filter_and_overlap_keep_fleet_keys() {
+        let flights = parse_flights(
+            br#"[
+              {"icao24":"abcdef","firstSeen":100,"estDepartureAirport":"KAPA"},
+              {"icao24":"ffffff","firstSeen":100,"estDepartureAirport":"KJFK"},
+              {"icao24":"abcdef","firstSeen":200}
+            ]"#,
+        )
+        .unwrap();
+        let fleet = ["abcdef".to_string()].into_iter().collect();
+        let kept = filter_flights_to_fleet(&flights, &fleet);
+        assert_eq!(kept.len(), 2);
+        let journal = [("abcdef".to_string(), 100)].into_iter().collect();
+        let o = overlap_fleet_journal(&flights, &fleet, &journal);
+        assert_eq!(o.fleet_count, 2);
+        assert_eq!(o.fleet_hexes, 1);
+        assert_eq!(o.matched_keys, 1);
+        assert_eq!(o.extra_vs_journal, 1);
+        assert_eq!(o.missing_from_journal, 0);
+    }
+
+    #[test]
     fn historical_flights_call_is_thirty_credits() {
         assert_eq!(FLIGHTS_CALL_CREDITS, 30);
+        assert_eq!(FLIGHTS_ALL_SLICE_CREDITS, 30);
         assert!(!full_fleet_fallback_allowed());
+    }
+
+    #[test]
+    fn icao24_filter_states_call_is_four_credits() {
+        assert_eq!(STATES_CALL_CREDITS, 4);
+        assert_eq!(estimated_states_credits(0), 0);
+        assert_eq!(estimated_states_credits(1), 4);
+        assert_eq!(estimated_states_credits(80), 4);
+        assert_eq!(estimated_states_credits(81), 8);
+        assert_eq!(estimated_states_credits(343), 20);
+        assert_eq!(states_request_count(343), 5);
     }
 
     #[test]

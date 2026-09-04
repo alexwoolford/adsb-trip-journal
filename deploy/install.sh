@@ -8,9 +8,12 @@
 # Set FORCE_REBUILD=1 to rebuild even when target/release/adsb-trip-journal exists.
 #
 # Optional inputs (do not overwrite existing host copies unless FORCE_*=1):
-#   ADSB_MAPPING_SQLITE  path to tail_to_ticker.sqlite
+#   ADSB_MAPPING_SQLITE  optional leftover copy under $STATE/mapping (not the live feed)
 #   ADSB_AIRPORTS_CSV    path to OurAirports airports.csv
 #   ADSB_ENV_FILE        populated env (chmod 600); used only if dest is missing
+# Live mapping is TAIL_TO_TICKER_SQLITE in the env file (default
+# /var/lib/tail-to-ticker/current/tail_to_ticker.sqlite). Units enable only
+# when that file exists; $STATE/mapping/ is not required.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -96,7 +99,9 @@ fi
 
 chown -R "$USER_NAME:$GROUP_NAME" "$STATE"
 chown -R root:root "$PREFIX"
-chown root:"$GROUP_NAME" "$ENV_DST"
+chown root:"$GROUP_NAME" "$PREFIX/etc" "$ENV_DST"
+chmod 0750 "$PREFIX/etc"
+chmod 0600 "$ENV_DST"
 chmod 0755 "$PREFIX/scripts"/*.sh
 
 install -m 0644 "$ROOT/deploy/systemd/adsb-trip-journal-watch.service" \
@@ -118,15 +123,27 @@ if [[ -f "$ENV_DST" ]] && grep -qE '^OPENSKY_CLIENT_SECRET=.+' "$ENV_DST"; then
   creds_set=1
 fi
 
+live_mapping="/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite"
+if [[ -f "$ENV_DST" ]]; then
+  live_val="$(grep -E '^TAIL_TO_TICKER_SQLITE=' "$ENV_DST" | tail -n1 | cut -d= -f2- || true)"
+  live_val="${live_val%\"}"
+  live_val="${live_val#\"}"
+  if [[ -n "$live_val" ]]; then
+    live_mapping="$live_val"
+  fi
+fi
+
 echo "installed:"
 echo "  prefix=$PREFIX state=$STATE"
-echo "  mapping: $MAPPING_DST"
+echo "  live mapping: $live_mapping"
+echo "  leftover copy: $MAPPING_DST (optional; not the live feed)"
 echo "  airports: $AIRPORTS_DST"
 echo "  logs: journalctl -u adsb-trip-journal-watch.service -u adsb-trip-journal-collect.service"
 echo "  edit: $ENV_DST (chmod 600)"
 
-if [[ ! -f "$MAPPING_DST" ]]; then
-  echo "  missing mapping sqlite — copy tail_to_ticker.sqlite to $MAPPING_DST" >&2
+if [[ ! -f "$live_mapping" ]]; then
+  echo "  missing live mapping sqlite $live_mapping" >&2
+  echo "  publish tail-to-ticker current/ or set TAIL_TO_TICKER_SQLITE in $ENV_DST" >&2
   echo "  units not enabled." >&2
   exit 1
 fi

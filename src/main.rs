@@ -1,5 +1,6 @@
 //! CLI for the ADS-B trip journal.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +81,9 @@ enum Commands {
         /// With --opensky: flights window length in hours starting 12:00 UTC (skips /states/all).
         #[arg(long)]
         window_hours: Option<u32>,
+        /// With --opensky: probe GET /flights/all for a 2h slice (skips /states/all and /flights/aircraft).
+        #[arg(long)]
+        flights_all: bool,
     },
     /// Download OurAirports airports.csv into cache/.
     AirportsFetch {
@@ -101,17 +105,17 @@ enum Commands {
         max_polls: Option<u32>,
         #[arg(long, value_enum, default_value_t = SourceArg::Adsbx)]
         source: SourceArg,
-        /// Cap OpenSky /flights/aircraft spend (observed 30 credits per historical call).
-        #[arg(long, default_value_t = 3_500)]
+        /// Cap OpenSky `/flights/all` spend (12 slices/day; historical slices billed 30 on this account).
+        #[arg(long, default_value_t = 500)]
         max_flights_credits: u32,
         /// Skip /tracks when both OpenSky airport estimates are missing.
         #[arg(long, default_value_t = false)]
         no_tracks_fallback: bool,
-        /// Restrict OpenSky collect to these hexes (repeatable). Bypasses the watch list.
+        /// Restrict OpenSky collect ingest to these hexes (repeatable). `/flights/all` still runs 12 times.
         #[arg(long = "hex")]
         hexes: Vec<String>,
     },
-    /// Poll OpenSky /states/all and record hexes seen airborne (hybrid watch list).
+    /// Poll OpenSky /states/all and record hexes seen airborne (not a collect gate).
     Watch {
         #[arg(long, value_enum, default_value_t = SourceArg::Opensky)]
         source: SourceArg,
@@ -145,10 +149,16 @@ async fn main() -> Result<()> {
             date,
             opensky,
             window_hours,
+            flights_all,
         } => {
-            if *opensky {
+            if *opensky && *flights_all {
+                cmd_probe_flights_all(&cli, date.as_deref()).await?;
+            } else if *opensky {
                 cmd_probe_opensky(&cli, hex.clone(), date.as_deref(), *window_hours).await?;
             } else {
+                if *flights_all {
+                    anyhow::bail!("--flights-all requires --opensky");
+                }
                 cmd_probe(&cli, hex.clone(), date.as_deref()).await?;
             }
         }
@@ -406,8 +416,90 @@ async fn cmd_probe_opensky(
     Ok(())
 }
 
+async fn cmd_probe_flights_all(cli: &Cli, date: Option<&str>) -> Result<()> {
+    let cfg = OpenskyConfig::from_env()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "probe --opensky --flights-all needs OPENSKY_CLIENT_ID + OPENSKY_CLIENT_SECRET, or OPENSKY_CREDENTIALS_JSON"
+        )
+    })?;
+    let client = OpenskyClient::new(cfg)?;
+    let date = match date {
+        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")?,
+        None => default_today_utc()
+            .pred_opt()
+            .unwrap_or_else(default_today_utc),
+    };
+    let (begin, end) = adsb_trip_journal::opensky::utc_hours_window(date, 12, 2);
+    let fleet: HashSet<String> = if cli.mapping_sqlite.exists() {
+        let conn = fleet::open_mapping_ro(&cli.mapping_sqlite)?;
+        query_fleet(&conn)?
+            .rows
+            .into_iter()
+            .map(|r| r.icao24)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let journal = cli
+        .journal_sqlite
+        .clone()
+        .unwrap_or_else(|| cli.data_dir.join("trips.sqlite"));
+    let journal_keys: HashSet<(String, i64)> = if journal.exists() {
+        let db = JournalDb::open(&journal)?;
+        db.trip_keys_between(begin, end)?.into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+    let before = previous_flights_all_remaining(&cli.data_dir);
+    let report = client
+        .probe_flights_all(date, 12, before, &fleet, &journal_keys)
+        .await?;
+    println!(
+        "opensky flights/all probe date={} window={} abort={} note={}",
+        report.date, report.flights_window, report.abort, report.note
+    );
+    println!(
+        "  status={} bytes={} elapsed_ms={} raw_count={}",
+        report
+            .flights_status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "—".into()),
+        report.body_bytes,
+        report.elapsed_ms,
+        report.raw_count
+    );
+    println!(
+        "  remaining_before={:?} remaining_after={:?} spent={:?}",
+        report.flights_remaining_before, report.flights_remaining, report.flights_credits_spent
+    );
+    println!(
+        "  fleet_flights={} fleet_hexes={} journal_in_window={} matched={} extra={} missing={}",
+        report.fleet_count,
+        report.fleet_hexes,
+        report.journal_trips_in_window,
+        report.matched_keys,
+        report.extra_vs_journal,
+        report.missing_from_journal
+    );
+    std::fs::create_dir_all(&cli.data_dir)?;
+    let out = cli.data_dir.join("flights_all_probe.json");
+    std::fs::write(&out, serde_json::to_vec_pretty(&report)?)?;
+    println!("wrote {}", out.display());
+    if report.abort {
+        anyhow::bail!("flights/all probe aborted; do not switch collect");
+    }
+    Ok(())
+}
+
 fn previous_flights_remaining(data_dir: &Path) -> Option<u32> {
-    let path = data_dir.join("access_probe.json");
+    remaining_from_probe_json(&data_dir.join("access_probe.json"))
+}
+
+fn previous_flights_all_remaining(data_dir: &Path) -> Option<u32> {
+    remaining_from_probe_json(&data_dir.join("flights_all_probe.json"))
+}
+
+fn remaining_from_probe_json(path: &Path) -> Option<u32> {
     let raw = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     v.get("flights_remaining")
@@ -492,7 +584,7 @@ fn print_report(r: &CollectReport) {
     );
     if r.dates_skipped_no_watch > 0 {
         println!(
-            "  skipped_no_watch_dates={} (empty seen_airborne; not an error)",
+            "  skipped_no_watch_dates={} (unused for /flights/all collect)",
             r.dates_skipped_no_watch
         );
     }
