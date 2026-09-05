@@ -14,6 +14,8 @@
 # Live mapping is TAIL_TO_TICKER_SQLITE in the env file (default
 # /var/lib/tail-to-ticker/current/tail_to_ticker.sqlite). Units enable only
 # when that file exists; $STATE/mapping/ is not required.
+# Watch is optional (collect does not read seen_airborne). This script still
+# enables the watch unit; disable it after nightly /flights/all is proven.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

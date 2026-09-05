@@ -28,10 +28,9 @@ pub const TRACKS_CALL_CREDITS: u32 = 4;
 /// Serial-only `/states/all` is 1; icao24/bbox billed **4** on this account
 /// (2026-09-02 watch: 5 chunks of 80 → remaining dropped 20/poll).
 pub const STATES_CALL_CREDITS: u32 = 4;
-/// Full-fleet yesterday at 30/call exceeds the 4,000 bucket. Per-hex collect cannot scale.
-pub fn full_fleet_fallback_allowed() -> bool {
-    FLIGHTS_CALL_CREDITS < 30
-}
+/// Catch-up budget: two UTC days of `/flights/all` at 30/slice is 720.
+/// Host env matches; `install.sh` does not overwrite an existing env file.
+pub const DEFAULT_MAX_FLIGHTS_CREDITS: u32 = 800;
 pub const HEX_CHUNK: usize = 80;
 /// `/flights/all` max window. Twelve adjacent slices cover one UTC day.
 pub const FLIGHTS_ALL_SLICES_PER_DAY: u32 = 12;
@@ -42,8 +41,9 @@ pub const FLIGHTS_ALL_SLICE_SECS: i64 = 7_200;
 pub const FLIGHTS_ALL_SLICE_CREDITS: u32 = 30;
 const STATES_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const FLIGHTS_ALL_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
-/// How far back default collect looks for trip/watch days that were never
-/// covered by `/flights/all`. Incomplete slice rows always resume, even older.
+/// How far back default collect looks for trip days that were never covered
+/// by `/flights/all`. Watch `seen_airborne` is not used. Incomplete slice
+/// rows always resume, even older.
 pub const FLIGHTS_ALL_LOOKBACK_DAYS: u64 = 14;
 
 /// How many `/states/all` requests a fleet of `n_hexes` needs at [`HEX_CHUNK`].
@@ -195,7 +195,7 @@ pub struct Flight {
     pub est_arrival_airport: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TrackEnds {
     pub dep_lat: f64,
     pub dep_lon: f64,
@@ -966,8 +966,6 @@ pub fn flight_to_trip(
     }
 
     let (dep_lat, dep_lon) = (dep_lat?, dep_lon?);
-    let arr_lat = arr_lat.unwrap_or(dep_lat);
-    let arr_lon = arr_lon.unwrap_or(dep_lon);
 
     let dep_ts = Utc
         .timestamp_opt(flight.first_seen, 0)
@@ -981,9 +979,11 @@ pub fn flight_to_trip(
     let dep_place = dep_ident
         .map(|s| s.to_string())
         .unwrap_or_else(|| crate::airports::format_latlon(dep_lat, dep_lon));
-    let arr_place = arr_ident
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| crate::airports::format_latlon(arr_lat, arr_lon));
+    let arr_place = arr_ident.map(|s| s.to_string()).or_else(|| {
+        arr_lat
+            .zip(arr_lon)
+            .map(|(la, lo)| crate::airports::format_latlon(la, lo))
+    });
 
     Some(TripRow {
         icao24: row.icao24.clone(),
@@ -994,8 +994,8 @@ pub fn flight_to_trip(
         cik: row.cik.clone(),
         dep_lat: Some(dep_lat),
         dep_lon: Some(dep_lon),
-        arr_lat: Some(arr_lat),
-        arr_lon: Some(arr_lon),
+        arr_lat,
+        arr_lon,
         dep_airport: dep_ident
             .filter(|_| dep_ap.is_some())
             .map(|s| s.to_string()),
@@ -1003,7 +1003,7 @@ pub fn flight_to_trip(
             .filter(|_| arr_ap.is_some())
             .map(|s| s.to_string()),
         dep_place: Some(dep_place),
-        arr_place: Some(arr_place),
+        arr_place,
         source: source.as_str().to_string(),
         fetched_at: fetched_at.to_string(),
     })
@@ -1096,7 +1096,7 @@ mod tests {
     fn historical_flights_call_is_thirty_credits() {
         assert_eq!(FLIGHTS_CALL_CREDITS, 30);
         assert_eq!(FLIGHTS_ALL_SLICE_CREDITS, 30);
-        assert!(!full_fleet_fallback_allowed());
+        assert_eq!(DEFAULT_MAX_FLIGHTS_CREDITS, 800);
     }
 
     #[test]
@@ -1209,6 +1209,41 @@ mod tests {
         assert_eq!(trip.arr_airport.as_deref(), Some("KJFK"));
         assert_eq!(trip.source, "opensky_flights");
         assert!(trip.dep_lat.unwrap() > 39.0);
+        assert!(trip.arr_lat.is_some());
+    }
+
+    #[test]
+    fn flight_to_trip_does_not_copy_dep_as_arrival() {
+        let csv = "ident,type,latitude_deg,longitude_deg\nKAPA,large_airport,39.5701,-104.6737\n";
+        let idx = AirportIndex::from_reader(csv.as_bytes()).unwrap();
+        let row = FleetRow {
+            n_number: "N1".into(),
+            icao24: "abcdef".into(),
+            ticker: "AAA".into(),
+            cik: None,
+            company_name: None,
+            make: None,
+            model: None,
+            registrant_name: None,
+            match_method: None,
+            aviation_issuer: 0,
+            fleet_size: 1,
+            as_of_date: None,
+        };
+        let flight = Flight {
+            icao24: "abcdef".into(),
+            first_seen: 1_705_276_800,
+            last_seen: Some(1_705_280_400),
+            est_departure_airport: Some("KAPA".into()),
+            est_arrival_airport: None,
+        };
+        let trip =
+            flight_to_trip(&flight, &row, &idx, None, "t", TripSource::OpenskyFlights).unwrap();
+        assert_eq!(trip.dep_airport.as_deref(), Some("KAPA"));
+        assert!(trip.arr_airport.is_none());
+        assert!(trip.arr_lat.is_none());
+        assert!(trip.arr_lon.is_none());
+        assert!(trip.arr_place.is_none());
     }
 
     #[test]
@@ -1280,6 +1315,7 @@ mod tests {
         .unwrap();
         assert!(trip.dep_airport.is_none());
         assert!((trip.dep_lat.unwrap() - 39.57).abs() < 1e-9);
+        assert!((trip.arr_lat.unwrap() - 40.64).abs() < 1e-9);
         assert_eq!(trip.source, "opensky_track");
     }
 }

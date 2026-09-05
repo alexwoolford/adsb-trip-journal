@@ -10,7 +10,7 @@ MAPPING="${TAIL_TO_TICKER_SQLITE:-/var/lib/tail-to-ticker/current/tail_to_ticker
 JOURNAL="${TRIP_JOURNAL_SQLITE:-$STATE/trips.sqlite}"
 CACHE="${TRIP_JOURNAL_CACHE:-$STATE/cache}"
 LOCK="${ADSB_COLLECT_LOCK:-$STATE/.collect.lock}"
-MAX_CREDITS="${OPENSKY_MAX_FLIGHTS_CREDITS:-500}"
+MAX_CREDITS="${OPENSKY_MAX_FLIGHTS_CREDITS:-800}"
 
 test -x "$BIN" || {
   echo "missing $BIN — build with: cargo build --release" >&2

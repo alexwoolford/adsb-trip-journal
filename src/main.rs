@@ -16,7 +16,7 @@ use adsb_trip_journal::collect::{
     CollectSource,
 };
 use adsb_trip_journal::fleet::{self, query_fleet};
-use adsb_trip_journal::opensky::{OpenskyClient, OpenskyConfig};
+use adsb_trip_journal::opensky::{OpenskyClient, OpenskyConfig, DEFAULT_MAX_FLIGHTS_CREDITS};
 use adsb_trip_journal::store::JournalDb;
 
 const DEFAULT_MAPPING: &str = "../tail-to-ticker/data/current/tail_to_ticker.sqlite";
@@ -53,8 +53,8 @@ struct Cli {
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum SourceArg {
     #[default]
-    Adsbx,
     Opensky,
+    Adsbx,
 }
 
 impl SourceArg {
@@ -103,15 +103,15 @@ enum Commands {
         poll_interval_secs: u64,
         #[arg(long)]
         max_polls: Option<u32>,
-        #[arg(long, value_enum, default_value_t = SourceArg::Adsbx)]
+        #[arg(long, value_enum, default_value_t = SourceArg::Opensky)]
         source: SourceArg,
         /// Cap OpenSky `/flights/all` spend (12 slices/day; historical slices billed 30 on this account).
-        #[arg(long, default_value_t = 500)]
+        #[arg(long, default_value_t = DEFAULT_MAX_FLIGHTS_CREDITS)]
         max_flights_credits: u32,
         /// Skip /tracks when both OpenSky airport estimates are missing.
         #[arg(long, default_value_t = false)]
         no_tracks_fallback: bool,
-        /// Restrict OpenSky collect ingest to these hexes (repeatable). `/flights/all` still runs 12 times.
+        /// Restrict OpenSky ingest to these hexes (repeatable). Slice cache is still the full mapped fleet; a `--hex` run does not mark the UTC day complete.
         #[arg(long = "hex")]
         hexes: Vec<String>,
     },
@@ -582,12 +582,6 @@ fn print_report(r: &CollectReport) {
         r.live_polls,
         r.live_trips
     );
-    if r.dates_skipped_no_watch > 0 {
-        println!(
-            "  skipped_no_watch_dates={} (unused for /flights/all collect)",
-            r.dates_skipped_no_watch
-        );
-    }
     if r.flights_calls > 0
         || r.tracks_calls > 0
         || r.estimated_flights_credits > 0

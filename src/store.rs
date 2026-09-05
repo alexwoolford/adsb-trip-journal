@@ -514,8 +514,9 @@ impl JournalDb {
     }
 
     /// Oldest UTC date that still needs `/flights/all` slices, else `yesterday`.
-    /// Incomplete slice rows always resume. Trip/watch days without slices are
-    /// only considered inside `lookback_days` so collect stays bounded.
+    /// Incomplete slice rows always resume. Trip days without slices are only
+    /// considered inside `lookback_days` so collect stays bounded. Watch
+    /// `seen_airborne` does not pull the start date backward.
     pub fn default_opensky_collect_from(
         &self,
         yesterday: NaiveDate,
@@ -546,7 +547,7 @@ impl JournalDb {
         while d <= yesterday {
             if d < start
                 && !self.flights_all_day_complete(d, n_slices)?
-                && (d == yesterday || self.has_trips_on(d)? || self.has_seen_airborne_on(d)?)
+                && (d == yesterday || self.has_trips_on(d)?)
             {
                 start = d;
             }
@@ -918,6 +919,20 @@ mod tests {
         assert!(!db.flights_all_day_complete(d, 12).unwrap());
         db.set_flights_all_error(d, "flights/all HTTP 429").unwrap();
         assert!(!db.flights_all_day_complete(d, 12).unwrap());
+    }
+
+    #[test]
+    fn default_from_ignores_seen_airborne() {
+        let dir = tempdir().unwrap();
+        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        db.mark_seen_airborne("abcdef", d).unwrap();
+        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
+        assert_eq!(
+            start, yesterday,
+            "watch seen_airborne must not pull collect start backward"
+        );
     }
 
     #[test]

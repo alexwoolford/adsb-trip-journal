@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Long-running OpenSky /states/all watch. Writes seen_airborne for today UTC.
+# Optional diagnostic: collect does not read this table. Keep the unit for a
+# manual “who is up” poll; disable after nightly /flights/all looks healthy.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

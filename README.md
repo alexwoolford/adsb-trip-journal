@@ -14,7 +14,7 @@ data/current/tail_to_ticker.sqlite   (READ ONLY)
   mappings_current
         │
         ▼
-adsb-trip-journal  →  data/trips.sqlite + cache/traces/…
+adsb-trip-journal  →  data/trips.sqlite + cache/flights_all/…
 ```
 
 ## Access reality (read this first)
@@ -60,23 +60,25 @@ export TAIL_TO_TICKER_SQLITE="../tail-to-ticker/data/current/tail_to_ticker.sqli
 ./target/release/adsb-trip-journal status
 ```
 
-Cached traces under `cache/traces/YYYY-MM-DD/{icao24}.json.gz` are processed even without an API key (the test path, and a way to ingest files you already have a license to store).
+Default `--source` is **opensky** (production). `--source adsbx` is non-prod: cache/tests, or traces you already have a license to store. Do not treat ADSBX as the host collector.
 
-`--from` defaults to the oldest incomplete `/flights/all` UTC day (slice resume, or a trip/watch day inside a 14-day lookback), else yesterday UTC. There is no unbounded multi-year loop until probe shows historical traces return 200.
+Cached ADSBX traces under `cache/traces/YYYY-MM-DD/{icao24}.json.gz` are processed with `--source adsbx` even without an API key (the test path).
 
-Live fallback (only useful if live works and traces do not):
+`--from` defaults to the oldest incomplete `/flights/all` UTC day (slice resume, or a trip day inside a 14-day lookback), else yesterday UTC. Watch `seen_airborne` does not pull collect start backward. There is no unbounded multi-year loop until probe shows historical traces return 200.
+
+Live fallback (ADSBX only, if live works and traces do not):
 
 ```bash
-./target/release/adsb-trip-journal collect --live --poll-interval-secs 300
+./target/release/adsb-trip-journal collect --source adsbx --live --poll-interval-secs 300
 ```
 
 ## OpenSky collector
 
 OpenSky Standard REST is **4,000 credits/day per independent bucket** (states / flights / tracks). Spending states credits does not buy flights credits. There is **no Trino** on this account — REST is the whole v1 path. Flights endpoints are a nightly batch: collect **yesterday UTC** (and earlier), not today.
 
-**Observed billing (this account):** historical `GET /flights/aircraft` costs **30** flights-credits even for a same-UTC-day window. At 30/call, a busy fleet day cannot finish inside 4,000 (~133 hexes). Collect therefore uses **`GET /flights/all`** (max 2 hours, all aircraft seen in the interval), twelve slices covering yesterday, then keeps mapped `icao24`s. Cost is per request, not per tail. A 2h historical slice billed **30** (2026-09-03 12:00–14:00 UTC probe: HTTP 200, ~2.3MB, 2.6s) so a day is **12 × 30 = 360**. `--max-flights-credits` default **500**. Filtered slices are cached under `cache/flights_all/YYYY-MM-DD/{00-11}.json.gz` so a retry does not re-spend credits. A UTC day is complete only after 12/12 slices; a 429 leaves the rest for the next run.
+**Observed billing (this account):** historical `GET /flights/aircraft` costs **30** flights-credits even for a same-UTC-day window. At 30/call, a busy fleet day cannot finish inside 4,000 (~133 hexes). Collect therefore uses **`GET /flights/all`** (max 2 hours, all aircraft seen in the interval), twelve slices covering yesterday, then keeps mapped `icao24`s. Cost is per request, not per tail. A 2h historical slice billed **30** (2026-09-03 12:00–14:00 UTC probe: HTTP 200, ~2.3MB, 2.6s) so a day is **12 × 30 = 360**. `--max-flights-credits` default **800** (fits two UTC days at 30/slice; matches the host env). `install.sh` does not overwrite an existing env file. Fleet-filtered slices are cached under `cache/flights_all/YYYY-MM-DD/{00-11}.json.gz` so a retry does not re-spend credits. `--hex` applies only at ingest and does not shrink that cache or mark the day complete. A UTC day is complete only after 12/12 slices; a 429 leaves the rest for the next run. Successful `/tracks` lookups are cached beside the slice so a 429 resume does not re-burn the tracks bucket.
 
-Watch still polls `/states/all` and writes `seen_airborne`. Collect is **not** gated on that list.
+Watch still polls `/states/all` and writes `seen_airborne`. Collect is **not** gated on that list. Watch is optional (~2,880 states-credits/day); keep the unit for a manual “who is up” poll and disable it after nightly collect looks healthy.
 
 | Call | What you get | Cost (observed / assumed) |
 |---|---|---|
@@ -95,11 +97,11 @@ Feed the **same** ADSBX Pi later (`readsb` Beast port 30005 → OpenSky feeder) 
 # export OPENSKY_CREDENTIALS_JSON=./credentials.json
 ./target/release/adsb-trip-journal probe --opensky
 ./target/release/adsb-trip-journal probe --opensky --flights-all --date 2026-09-03
-./target/release/adsb-trip-journal watch --source opensky --interval-secs 600
-./target/release/adsb-trip-journal collect --source opensky
+./target/release/adsb-trip-journal watch --interval-secs 600
+./target/release/adsb-trip-journal collect
 ```
 
-`watch` writes `seen_airborne` for today UTC (reloads the mapping fleet each poll). `collect --source opensky` covers yesterday with 12× `/flights/all` and does not use the watch list as an allow-list. Pass `--hex` to ingest only those mapped hexes (the 12 API calls still run).
+`watch` writes `seen_airborne` for today UTC (reloads the mapping fleet each poll). `collect` covers yesterday with 12× `/flights/all` and does not use the watch list as an allow-list. Pass `--hex` to ingest only those mapped hexes (the 12 API calls still run; cache stays the full fleet).
 
 ## Production (Linux)
 
@@ -112,7 +114,7 @@ sudo ADSB_AIRPORTS_CSV=/path/airports.csv \
      ./deploy/install.sh
 ```
 
-Watch is long-running (`/states/all` every 10 min, ~20 states-credits/poll for a ~331-hex fleet ≈ 2,880/day of the 4,000 states bucket). Collect is a daily timer at **06:00 UTC** (12× `/flights/all` for yesterday, ~360 flights-credits if slices bill 30). Production mapping path is `/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite` (`TAIL_TO_TICKER_SQLITE`); the `adsb` user must be able to read it. Watch re-opens it every poll. Wrappers default to that path; do not fall back to `$STATE/mapping/`.
+Watch is long-running (`/states/all` every 10 min, ~20 states-credits/poll for a ~331-hex fleet ≈ 2,880/day of the 4,000 states bucket). It is **optional** — collect does not read `seen_airborne`. Collect is a daily timer at **06:00 UTC** (12× `/flights/all` for yesterday, ~360 flights-credits if slices bill 30). Production mapping path is `/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite` (`TAIL_TO_TICKER_SQLITE`); the `adsb` user must be able to read it. Watch re-opens it every poll. Wrappers default to that path; do not fall back to `$STATE/mapping/`.
 
 Out of this pass: OpenSky feeder (8k tier), analyst HTTP API, alerts/geofences.
 
@@ -122,7 +124,8 @@ Default input (same consumer filter as tail-to-ticker):
 
 ```sql
 SELECT n_number, icao24, ticker, cik, company_name, make, model,
-       registrant_name, match_method, aviation_issuer, fleet_size
+       registrant_name, match_method, aviation_issuer, fleet_size,
+       as_of_date
 FROM mappings_current
 WHERE aviation_issuer = 0
   AND fleet_size BETWEEN 1 AND 6
@@ -134,7 +137,7 @@ Empty `icao24` rows are skipped and counted. OEM / lessor fleets (`aviation_issu
 
 ## Journal schema
 
-SQLite at `$TRIP_JOURNAL_SQLITE` (default `data/trips.sqlite`): `fleet_snapshot`, `trips`, `fetch_cursor`, `seen_airborne`, `flights_all_slice`, `flights_all_day`. See [`context/adsb-trip-journal-spec.md`](context/adsb-trip-journal-spec.md).
+SQLite at `$TRIP_JOURNAL_SQLITE` (default `data/trips.sqlite`): `fleet_snapshot`, `trips`, `fetch_cursor` (ADSBX), `seen_airborne` (watch diagnostic), `flights_all_slice`, `flights_all_day`. OpenSky resume is `flights_all` 12/12, not per-hex `fetch_cursor`. See [`context/adsb-trip-journal-spec.md`](context/adsb-trip-journal-spec.md). `trips.source` is `opensky_flights` or `opensky_track` (or `adsbx_*` when using `--source adsbx`).
 
 Analyst query:
 

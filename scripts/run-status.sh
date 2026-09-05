@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Print journal coverage (fleet snapshot, trips, cursors).
+# Print journal coverage (fleet snapshot, flights_all 12/12, trips).
 # Paths default to the production layout so this works without sourcing the 600 env file.
 set -euo pipefail
 
