@@ -1,4 +1,4 @@
-//! Sibling SQLite: `fleet_snapshot`, `trips`, `fetch_cursor`.
+//! Sibling SQLite: `fleet_snapshot`, `trips`, `flights_all_*`, leftover `fetch_cursor`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -11,9 +11,6 @@ use crate::fleet::FleetRow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TripSource {
-    AdsBxTraceHist,
-    AdsBxTraceRecent,
-    AdsBxLive,
     OpenskyFlights,
     OpenskyTrack,
 }
@@ -21,22 +18,8 @@ pub enum TripSource {
 impl TripSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::AdsBxTraceHist => "adsbx_trace_hist",
-            Self::AdsBxTraceRecent => "adsbx_trace_recent",
-            Self::AdsBxLive => "adsbx_live",
             Self::OpenskyFlights => "opensky_flights",
             Self::OpenskyTrack => "opensky_track",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "adsbx_trace_hist" => Some(Self::AdsBxTraceHist),
-            "adsbx_trace_recent" => Some(Self::AdsBxTraceRecent),
-            "adsbx_live" => Some(Self::AdsBxLive),
-            "opensky_flights" => Some(Self::OpenskyFlights),
-            "opensky_track" => Some(Self::OpenskyTrack),
-            _ => None,
         }
     }
 }
@@ -59,6 +42,14 @@ pub struct TripRow {
     pub arr_place: Option<String>,
     pub source: String,
     pub fetched_at: String,
+    /// OpenSky transponder label. Sparse; not identity; not a join key.
+    pub callsign: Option<String>,
+    pub dep_airport_horiz_m: Option<i64>,
+    pub dep_airport_vert_m: Option<i64>,
+    pub arr_airport_horiz_m: Option<i64>,
+    pub arr_airport_vert_m: Option<i64>,
+    pub dep_airport_candidates: Option<i64>,
+    pub arr_airport_candidates: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,13 +67,9 @@ pub struct JournalStatus {
     pub snapshot_as_of: Option<String>,
     pub recorded_at: Option<String>,
     pub trips: i64,
-    pub cursors: i64,
-    pub cursors_with_error: i64,
-    pub last_ok_min: Option<String>,
-    pub last_ok_max: Option<String>,
-    pub errors: Vec<(String, String)>,
     pub flights_all_complete_max: Option<String>,
     pub flights_all_incomplete: Vec<(String, i64)>,
+    pub flights_all_errors: Vec<(String, String)>,
 }
 
 pub struct JournalDb {
@@ -134,6 +121,13 @@ impl JournalDb {
               arr_place TEXT,
               source TEXT NOT NULL,
               fetched_at TEXT NOT NULL,
+              callsign TEXT,
+              dep_airport_horiz_m INTEGER,
+              dep_airport_vert_m INTEGER,
+              arr_airport_horiz_m INTEGER,
+              arr_airport_vert_m INTEGER,
+              dep_airport_candidates INTEGER,
+              arr_airport_candidates INTEGER,
               PRIMARY KEY (icao24, dep_ts)
             );
             CREATE INDEX IF NOT EXISTS idx_trips_ticker_dep ON trips (ticker, dep_ts);
@@ -163,6 +157,13 @@ impl JournalDb {
             );
             "#,
         )?;
+        ensure_column(&conn, "trips", "callsign", "TEXT")?;
+        ensure_column(&conn, "trips", "dep_airport_horiz_m", "INTEGER")?;
+        ensure_column(&conn, "trips", "dep_airport_vert_m", "INTEGER")?;
+        ensure_column(&conn, "trips", "arr_airport_horiz_m", "INTEGER")?;
+        ensure_column(&conn, "trips", "arr_airport_vert_m", "INTEGER")?;
+        ensure_column(&conn, "trips", "dep_airport_candidates", "INTEGER")?;
+        ensure_column(&conn, "trips", "arr_airport_candidates", "INTEGER")?;
         Ok(Self { conn })
     }
 
@@ -210,8 +211,15 @@ impl JournalDb {
               icao24, dep_ts, arr_ts, n_number, ticker, cik,
               dep_lat, dep_lon, arr_lat, arr_lon,
               dep_airport, arr_airport, dep_place, arr_place,
-              source, fetched_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+              source, fetched_at,
+              callsign,
+              dep_airport_horiz_m, dep_airport_vert_m,
+              arr_airport_horiz_m, arr_airport_vert_m,
+              dep_airport_candidates, arr_airport_candidates
+            ) VALUES (
+              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+              ?17, ?18, ?19, ?20, ?21, ?22, ?23
+            )
             "#,
             params![
                 row.icao24,
@@ -230,6 +238,13 @@ impl JournalDb {
                 row.arr_place,
                 row.source,
                 row.fetched_at,
+                row.callsign,
+                row.dep_airport_horiz_m,
+                row.dep_airport_vert_m,
+                row.arr_airport_horiz_m,
+                row.arr_airport_vert_m,
+                row.dep_airport_candidates,
+                row.arr_airport_candidates,
             ],
         )?;
         Ok(())
@@ -293,63 +308,6 @@ impl JournalDb {
         Ok(())
     }
 
-    pub fn open_trip(&self, icao24: &str) -> Result<Option<TripRow>> {
-        self.conn
-            .query_row(
-                r#"
-                SELECT icao24, dep_ts, arr_ts, n_number, ticker, cik,
-                       dep_lat, dep_lon, arr_lat, arr_lon,
-                       dep_airport, arr_airport, dep_place, arr_place,
-                       source, fetched_at
-                FROM trips
-                WHERE icao24 = ?1 AND arr_ts IS NULL
-                ORDER BY dep_ts DESC
-                LIMIT 1
-                "#,
-                [icao24],
-                trip_from_row,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn close_open_trip(
-        &self,
-        icao24: &str,
-        dep_ts: &str,
-        arr_ts: Option<&str>,
-        arr_lat: Option<f64>,
-        arr_lon: Option<f64>,
-        arr_airport: Option<&str>,
-        arr_place: Option<&str>,
-        fetched_at: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            r#"
-            UPDATE trips SET
-              arr_ts = ?1,
-              arr_lat = ?2,
-              arr_lon = ?3,
-              arr_airport = ?4,
-              arr_place = ?5,
-              fetched_at = ?6
-            WHERE icao24 = ?7 AND dep_ts = ?8
-            "#,
-            params![
-                arr_ts,
-                arr_lat,
-                arr_lon,
-                arr_airport,
-                arr_place,
-                fetched_at,
-                icao24,
-                dep_ts,
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn trip_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -363,7 +321,10 @@ impl JournalDb {
                 SELECT icao24, dep_ts, arr_ts, n_number, ticker, cik,
                        dep_lat, dep_lon, arr_lat, arr_lon,
                        dep_airport, arr_airport, dep_place, arr_place,
-                       source, fetched_at
+                       source, fetched_at, callsign,
+                       dep_airport_horiz_m, dep_airport_vert_m,
+                       arr_airport_horiz_m, arr_airport_vert_m,
+                       dep_airport_candidates, arr_airport_candidates
                 FROM trips WHERE icao24 = ?1 AND dep_ts = ?2
                 "#,
                 params![icao24, dep_ts],
@@ -480,15 +441,6 @@ impl JournalDb {
         Ok(n > 0)
     }
 
-    pub fn has_seen_airborne_on(&self, date: NaiveDate) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM seen_airborne WHERE utc_date = ?1",
-            [date.to_string()],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    }
-
     /// `(icao24, firstSeen unix)` for trips whose `dep_ts` falls in `[begin, end]` inclusive.
     pub fn trip_keys_between(&self, begin_unix: i64, end_unix: i64) -> Result<Vec<(String, i64)>> {
         let Some(start) = unix_to_iso(begin_unix) else {
@@ -575,30 +527,6 @@ impl JournalDb {
             })
             .optional()?;
         let trips = self.trip_count()?;
-        let cursors: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM fetch_cursor", [], |r| r.get(0))?;
-        let cursors_with_error: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM fetch_cursor WHERE last_error IS NOT NULL AND last_error <> ''",
-            [],
-            |r| r.get(0),
-        )?;
-        let last_ok_min: Option<String> =
-            self.conn
-                .query_row("SELECT MIN(last_ok_date) FROM fetch_cursor", [], |r| {
-                    r.get(0)
-                })?;
-        let last_ok_max: Option<String> =
-            self.conn
-                .query_row("SELECT MAX(last_ok_date) FROM fetch_cursor", [], |r| {
-                    r.get(0)
-                })?;
-        let mut err_stmt = self.conn.prepare(
-            "SELECT icao24, last_error FROM fetch_cursor WHERE last_error IS NOT NULL AND last_error <> '' ORDER BY icao24",
-        )?;
-        let errors = err_stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         let flights_all_complete_max: Option<String> = self
             .conn
             .query_row(
@@ -624,19 +552,25 @@ impl JournalDb {
         let flights_all_incomplete = inc_stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut err_stmt = self.conn.prepare(
+            r#"
+            SELECT utc_date, last_error FROM flights_all_day
+            WHERE last_error IS NOT NULL AND last_error <> ''
+            ORDER BY utc_date
+            "#,
+        )?;
+        let flights_all_errors = err_stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(JournalStatus {
             path: path.display().to_string(),
             fleet_hexes,
             snapshot_as_of,
             recorded_at,
             trips,
-            cursors,
-            cursors_with_error,
-            last_ok_min,
-            last_ok_max,
-            errors,
             flights_all_complete_max,
             flights_all_incomplete,
+            flights_all_errors,
         })
     }
 }
@@ -659,7 +593,31 @@ fn trip_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TripRow> {
         arr_place: row.get(13)?,
         source: row.get(14)?,
         fetched_at: row.get(15)?,
+        callsign: row.get(16)?,
+        dep_airport_horiz_m: row.get(17)?,
+        dep_airport_vert_m: row.get(18)?,
+        arr_airport_horiz_m: row.get(19)?,
+        arr_airport_vert_m: row.get(20)?,
+        dep_airport_candidates: row.get(21)?,
+        arr_airport_candidates: row.get(22)?,
     })
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("pragma table_info {table}"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|name| name.as_deref() == Ok(column));
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .with_context(|| format!("add {table}.{column}"))?;
+    }
+    Ok(())
 }
 
 pub fn utc_iso(dt: DateTime<Utc>) -> String {
@@ -758,6 +716,27 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_flights_all_errors_not_leftover_cursors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let db = JournalDb::open(&path).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+        db.set_cursor_error("ac7f36", "max-flights-credits cap")
+            .unwrap();
+        db.set_flights_all_error(d, "tracks HTTP 429 remaining=Some(0)")
+            .unwrap();
+        let status = db.status(&path).unwrap();
+        assert_eq!(
+            status.flights_all_errors,
+            vec![(
+                "2026-09-05".into(),
+                "tracks HTTP 429 remaining=Some(0)".into()
+            )]
+        );
+        assert!(db.get_cursor("ac7f36").unwrap().is_some());
+    }
+
+    #[test]
     fn trip_upsert_is_idempotent() {
         let dir = tempdir().unwrap();
         let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
@@ -776,8 +755,15 @@ mod tests {
             arr_airport: Some("KJFK".into()),
             dep_place: Some("KAPA".into()),
             arr_place: Some("KJFK".into()),
-            source: TripSource::AdsBxTraceHist.as_str().into(),
+            source: TripSource::OpenskyFlights.as_str().into(),
             fetched_at: "2026-08-31T00:00:00Z".into(),
+            callsign: None,
+            dep_airport_horiz_m: None,
+            dep_airport_vert_m: None,
+            arr_airport_horiz_m: None,
+            arr_airport_vert_m: None,
+            dep_airport_candidates: None,
+            arr_airport_candidates: None,
         };
         db.upsert_trip(&t).unwrap();
         db.upsert_trip(&t).unwrap();
@@ -958,6 +944,13 @@ mod tests {
             arr_place: Some("KJFK".into()),
             source: TripSource::OpenskyFlights.as_str().into(),
             fetched_at: "2026-09-04T06:00:00Z".into(),
+            callsign: None,
+            dep_airport_horiz_m: None,
+            dep_airport_vert_m: None,
+            arr_airport_horiz_m: None,
+            arr_airport_vert_m: None,
+            dep_airport_candidates: None,
+            arr_airport_candidates: None,
         })
         .unwrap();
         let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
@@ -1014,6 +1007,13 @@ mod tests {
             arr_place: Some("KJFK".into()),
             source: TripSource::OpenskyFlights.as_str().into(),
             fetched_at: "2026-09-04T06:00:00Z".into(),
+            callsign: None,
+            dep_airport_horiz_m: None,
+            dep_airport_vert_m: None,
+            arr_airport_horiz_m: None,
+            arr_airport_vert_m: None,
+            dep_airport_candidates: None,
+            arr_airport_candidates: None,
         };
         db.upsert_trip(&t).unwrap();
         let begin = iso_to_unix("2026-09-03T12:00:00Z").unwrap();
@@ -1026,6 +1026,73 @@ mod tests {
         assert!(!db
             .has_trips_on(NaiveDate::from_ymd_opt(2026, 9, 4).unwrap())
             .unwrap());
+    }
+
+    #[test]
+    fn ensure_column_adds_callsign_on_old_trips_table() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE trips (
+                  icao24 TEXT NOT NULL,
+                  dep_ts TEXT NOT NULL,
+                  arr_ts TEXT,
+                  n_number TEXT NOT NULL,
+                  ticker TEXT NOT NULL,
+                  cik TEXT,
+                  dep_lat REAL,
+                  dep_lon REAL,
+                  arr_lat REAL,
+                  arr_lon REAL,
+                  dep_airport TEXT,
+                  arr_airport TEXT,
+                  dep_place TEXT,
+                  arr_place TEXT,
+                  source TEXT NOT NULL,
+                  fetched_at TEXT NOT NULL,
+                  PRIMARY KEY (icao24, dep_ts)
+                );
+                "#,
+            )
+            .unwrap();
+        }
+        let db = JournalDb::open(&path).unwrap();
+        let t = TripRow {
+            icao24: "abcdef".into(),
+            dep_ts: "2024-01-15T12:00:00Z".into(),
+            arr_ts: None,
+            n_number: "N1".into(),
+            ticker: "AAA".into(),
+            cik: None,
+            dep_lat: Some(1.0),
+            dep_lon: Some(2.0),
+            arr_lat: Some(3.0),
+            arr_lon: Some(4.0),
+            dep_airport: Some("KAPA".into()),
+            arr_airport: Some("KJFK".into()),
+            dep_place: Some("KAPA".into()),
+            arr_place: Some("KJFK".into()),
+            source: TripSource::OpenskyFlights.as_str().into(),
+            fetched_at: "2026-09-04T06:00:00Z".into(),
+            callsign: Some("DCM1".into()),
+            dep_airport_horiz_m: Some(10),
+            dep_airport_vert_m: Some(20),
+            arr_airport_horiz_m: Some(30),
+            arr_airport_vert_m: Some(40),
+            dep_airport_candidates: Some(1),
+            arr_airport_candidates: Some(2),
+        };
+        db.upsert_trip(&t).unwrap();
+        let got = db
+            .get_trip("abcdef", "2024-01-15T12:00:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.callsign.as_deref(), Some("DCM1"));
+        assert_eq!(got.dep_airport_horiz_m, Some(10));
+        assert_eq!(got.arr_airport_candidates, Some(2));
     }
 
     #[test]

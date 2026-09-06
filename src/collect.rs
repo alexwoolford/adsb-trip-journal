@@ -1,4 +1,4 @@
-//! Daily collect loop: fleet snapshot → fetch/cache traces → segment → snap → trips.
+//! Daily collect loop: fleet snapshot → OpenSky /flights/all → snap → trips.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -15,25 +15,14 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use tracing::{info, warn};
 
-use crate::adsbx::{AdsBxClient, FetchOutcome};
 use crate::airports::AirportIndex;
 use crate::fleet::{self, FleetQuery, FleetRow};
-use crate::live::{parse_live_aircraft, CompletedLiveTrip, LiveTracker};
 use crate::opensky::{
     estimated_states_credits, filter_flights_to_fleet, flight_to_trip, states_request_count,
     utc_day_two_hour_slices, Flight, OpenskyClient, OpenskyOutcome, TrackEnds,
-    DEFAULT_MAX_FLIGHTS_CREDITS, FLIGHTS_ALL_LOOKBACK_DAYS, FLIGHTS_ALL_SLICES_PER_DAY,
-    FLIGHTS_ALL_SLICE_CREDITS,
+    FLIGHTS_ALL_LOOKBACK_DAYS, FLIGHTS_ALL_SLICES_PER_DAY, FLIGHTS_ALL_SLICE_CREDITS,
 };
-use crate::segment::{is_overnight_continuation, parse_trace_json, segment_legs, Leg};
-use crate::store::{utc_iso, JournalDb, TripRow, TripSource};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CollectSource {
-    #[default]
-    Opensky,
-    AdsBx,
-}
+use crate::store::{utc_iso, JournalDb, TripSource};
 
 pub struct CollectOptions {
     pub mapping_sqlite: PathBuf,
@@ -42,15 +31,6 @@ pub struct CollectOptions {
     pub airports_csv: Option<PathBuf>,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
-    pub live: bool,
-    pub poll_interval: Duration,
-    pub max_polls: Option<u32>,
-    /// When set, HTTP is used for missing cache days. When None, cache-only.
-    pub client: Option<AdsBxClient>,
-    /// Prefer recent traces over hist when hist is unavailable.
-    pub allow_hist: bool,
-    pub allow_recent: bool,
-    pub source: CollectSource,
     pub opensky: Option<Arc<OpenskyClient>>,
     pub max_flights_credits: u32,
     pub tracks_fallback: bool,
@@ -102,13 +82,13 @@ fn read_tracks_cache(path: &Path) -> Result<HashMap<String, Option<TrackEnds>>> 
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let raw = read_trace_cache(path)?;
+    let raw = read_gzip_cache(path)?;
     Ok(serde_json::from_slice(&raw).unwrap_or_default())
 }
 
 fn write_tracks_cache(path: &Path, map: &HashMap<String, Option<TrackEnds>>) -> Result<()> {
     let json = serde_json::to_vec(map)?;
-    write_trace_cache(path, &json)
+    write_gzip_cache(path, &json)
 }
 
 /// Cache set is the mapped fleet. `--hex` only restricts ingest.
@@ -166,14 +146,7 @@ impl OpenskyCollectApi for OpenskyClient {
     }
 }
 
-pub fn trace_cache_path(cache_dir: &Path, date: NaiveDate, icao24: &str) -> PathBuf {
-    cache_dir
-        .join("traces")
-        .join(date.to_string())
-        .join(format!("{icao24}.json.gz"))
-}
-
-pub fn write_trace_cache(path: &Path, json: &[u8]) -> Result<()> {
+pub fn write_gzip_cache(path: &Path, json: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -184,7 +157,7 @@ pub fn write_trace_cache(path: &Path, json: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn read_trace_cache(path: &Path) -> Result<Vec<u8>> {
+pub fn read_gzip_cache(path: &Path) -> Result<Vec<u8>> {
     let file = fs::File::open(path)?;
     let mut dec = GzDecoder::new(file);
     let mut buf = Vec::new();
@@ -214,376 +187,7 @@ pub async fn collect(opts: CollectOptions) -> Result<CollectReport> {
         }
     };
 
-    if opts.source == CollectSource::Opensky {
-        return collect_opensky(opts, fleet, db, airports).await;
-    }
-    if opts.live {
-        return collect_live(opts, fleet, db, airports).await;
-    }
-    collect_traces(opts, fleet, db, airports).await
-}
-
-async fn collect_traces(
-    opts: CollectOptions,
-    fleet: FleetQuery,
-    db: JournalDb,
-    airports: AirportIndex,
-) -> Result<CollectReport> {
-    let mut report = CollectReport {
-        fleet_hexes: fleet.rows.len(),
-        skipped_empty_icao24: fleet.skipped_empty_icao24,
-        ..CollectReport::default()
-    };
-    let today = opts.to.unwrap_or_else(default_today_utc);
-    let fetched_at = utc_iso(Utc::now());
-
-    for row in &fleet.rows {
-        let start = match opts.from {
-            Some(d) => d,
-            None => match db.last_ok_date(&row.icao24)? {
-                Some(last) => last.succ_opt().unwrap_or(last),
-                None => today,
-            },
-        };
-        if start > today {
-            continue;
-        }
-
-        let mut date = start;
-        while date <= today {
-            match ingest_hex_day(&opts, &db, &airports, row, date, &fetched_at, &mut report).await?
-            {
-                DayResult::Ok | DayResult::NotFound => {
-                    date = match date.succ_opt() {
-                        Some(n) => n,
-                        None => break,
-                    };
-                }
-                DayResult::StopHex => {
-                    report.hexes_stopped_on_error += 1;
-                    break;
-                }
-            }
-        }
-    }
-    Ok(report)
-}
-
-enum DayResult {
-    Ok,
-    NotFound,
-    StopHex,
-}
-
-async fn ingest_hex_day(
-    opts: &CollectOptions,
-    db: &JournalDb,
-    airports: &AirportIndex,
-    row: &FleetRow,
-    date: NaiveDate,
-    fetched_at: &str,
-    report: &mut CollectReport,
-) -> Result<DayResult> {
-    let cache_path = trace_cache_path(&opts.cache_dir, date, &row.icao24);
-
-    let (json, source, from_cache) = if cache_path.exists() {
-        report.days_from_cache += 1;
-        (
-            read_trace_cache(&cache_path)?,
-            TripSource::AdsBxTraceHist,
-            true,
-        )
-    } else if let Some(client) = &opts.client {
-        match fetch_day(client, opts, &row.icao24, date).await? {
-            FetchDay::Trace { body, source } => {
-                write_trace_cache(&cache_path, &body)?;
-                (body, source, false)
-            }
-            FetchDay::NotFound => {
-                db.advance_cursor_ok(&row.icao24, date)?;
-                report.days_not_found += 1;
-                report.days_ok += 1;
-                return Ok(DayResult::NotFound);
-            }
-            FetchDay::Fatal(msg) => {
-                warn!(icao24 = %row.icao24, date = %date, %msg, "fetch failed; cursor not advanced");
-                db.set_cursor_error(&row.icao24, &msg)?;
-                return Ok(DayResult::StopHex);
-            }
-        }
-    } else {
-        let msg = format!("no cache for {date} and no API client");
-        db.set_cursor_error(&row.icao24, &msg)?;
-        return Ok(DayResult::StopHex);
-    };
-
-    let _ = from_cache;
-    let file = parse_trace_json(&json)?;
-    let mut legs = segment_legs(&file);
-    merge_overnight(db, row, &mut legs, airports, source, fetched_at)?;
-
-    for leg in legs {
-        let trip = snap_trip(row, &leg, airports, source, fetched_at);
-        db.upsert_trip(&trip)?;
-        report.trips_upserted += 1;
-    }
-    db.advance_cursor_ok(&row.icao24, date)?;
-    report.days_ok += 1;
-    Ok(DayResult::Ok)
-}
-
-enum FetchDay {
-    Trace { body: Vec<u8>, source: TripSource },
-    NotFound,
-    Fatal(String),
-}
-
-async fn fetch_day(
-    client: &AdsBxClient,
-    opts: &CollectOptions,
-    icao24: &str,
-    date: NaiveDate,
-) -> Result<FetchDay> {
-    if opts.allow_hist {
-        match retry_fetch(|| client.fetch_hist(icao24, date)).await? {
-            FetchOutcome::Ok { body } => {
-                return Ok(FetchDay::Trace {
-                    body,
-                    source: TripSource::AdsBxTraceHist,
-                })
-            }
-            FetchOutcome::NotFound => return Ok(FetchDay::NotFound),
-            FetchOutcome::Denied { status, message } => {
-                return Ok(FetchDay::Fatal(format!("hist HTTP {status}: {message}")))
-            }
-            FetchOutcome::RateLimited { retry_after } => {
-                return Ok(FetchDay::Fatal(format!(
-                    "hist HTTP 429 retry-after={retry_after:?}"
-                )))
-            }
-            FetchOutcome::Other { status, message } => {
-                // Fall through to recent if hist is simply unimplemented on this key.
-                if status == 404 {
-                    return Ok(FetchDay::NotFound);
-                }
-                if !opts.allow_recent {
-                    return Ok(FetchDay::Fatal(format!("hist HTTP {status}: {message}")));
-                }
-            }
-        }
-    }
-
-    if opts.allow_recent {
-        match retry_fetch(|| client.fetch_recent(icao24)).await? {
-            FetchOutcome::Ok { body } => {
-                return Ok(FetchDay::Trace {
-                    body,
-                    source: TripSource::AdsBxTraceRecent,
-                })
-            }
-            FetchOutcome::NotFound => return Ok(FetchDay::NotFound),
-            other => {
-                if let Some(msg) = other.error_message() {
-                    return Ok(FetchDay::Fatal(format!("recent {msg}")));
-                }
-            }
-        }
-    }
-
-    Ok(FetchDay::Fatal(
-        "no hist/recent access and no cached trace".into(),
-    ))
-}
-
-async fn retry_fetch<F, Fut>(mut f: F) -> Result<FetchOutcome>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<FetchOutcome>>,
-{
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        match f().await? {
-            FetchOutcome::RateLimited { retry_after } if attempts < 4 => {
-                let wait = retry_after.unwrap_or(30).min(120);
-                warn!(wait, attempts, "429; sleeping");
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-            }
-            other => return Ok(other),
-        }
-    }
-}
-
-fn merge_overnight(
-    db: &JournalDb,
-    row: &FleetRow,
-    legs: &mut Vec<Leg>,
-    airports: &AirportIndex,
-    _source: TripSource,
-    fetched_at: &str,
-) -> Result<()> {
-    let Some(open) = db.open_trip(&row.icao24)? else {
-        return Ok(());
-    };
-    if legs.is_empty() {
-        return Ok(());
-    }
-    if !is_overnight_continuation(&legs[0]) {
-        return Ok(());
-    }
-    let first = legs.remove(0);
-    let arr_snap = airports.snap(first.arr_lat, first.arr_lon);
-    let arr_ts = first.arr_ts.map(utc_iso);
-    db.close_open_trip(
-        &open.icao24,
-        &open.dep_ts,
-        arr_ts.as_deref(),
-        Some(first.arr_lat),
-        Some(first.arr_lon),
-        arr_snap.ident.as_deref(),
-        Some(arr_snap.place.as_str()),
-        fetched_at,
-    )?;
-    Ok(())
-}
-
-fn snap_trip(
-    row: &FleetRow,
-    leg: &Leg,
-    airports: &AirportIndex,
-    source: TripSource,
-    fetched_at: &str,
-) -> TripRow {
-    let dep = airports.snap(leg.dep_lat, leg.dep_lon);
-    let arr = airports.snap(leg.arr_lat, leg.arr_lon);
-    TripRow {
-        icao24: row.icao24.clone(),
-        dep_ts: utc_iso(leg.dep_ts),
-        arr_ts: leg.arr_ts.map(utc_iso),
-        n_number: row.n_number.clone(),
-        ticker: row.ticker.clone(),
-        cik: row.cik.clone(),
-        dep_lat: Some(leg.dep_lat),
-        dep_lon: Some(leg.dep_lon),
-        arr_lat: Some(leg.arr_lat),
-        arr_lon: Some(leg.arr_lon),
-        dep_airport: dep.ident,
-        arr_airport: arr.ident,
-        dep_place: Some(dep.place),
-        arr_place: Some(arr.place),
-        source: source.as_str().to_string(),
-        fetched_at: fetched_at.to_string(),
-    }
-}
-
-fn live_trip_row(t: &CompletedLiveTrip, airports: &AirportIndex, fetched_at: &str) -> TripRow {
-    let dep = airports.snap(t.dep_lat, t.dep_lon);
-    let arr = airports.snap(t.arr_lat, t.arr_lon);
-    TripRow {
-        icao24: t.icao24.clone(),
-        dep_ts: utc_iso(t.dep_ts),
-        arr_ts: Some(utc_iso(t.arr_ts)),
-        n_number: t.n_number.clone(),
-        ticker: t.ticker.clone(),
-        cik: t.cik.clone(),
-        dep_lat: Some(t.dep_lat),
-        dep_lon: Some(t.dep_lon),
-        arr_lat: Some(t.arr_lat),
-        arr_lon: Some(t.arr_lon),
-        dep_airport: dep.ident,
-        arr_airport: arr.ident,
-        dep_place: Some(dep.place),
-        arr_place: Some(arr.place),
-        source: t.source.as_str().to_string(),
-        fetched_at: fetched_at.to_string(),
-    }
-}
-
-async fn collect_live(
-    opts: CollectOptions,
-    fleet: FleetQuery,
-    db: JournalDb,
-    airports: AirportIndex,
-) -> Result<CollectReport> {
-    let mut report = CollectReport {
-        fleet_hexes: fleet.rows.len(),
-        skipped_empty_icao24: fleet.skipped_empty_icao24,
-        ..CollectReport::default()
-    };
-    let Some(client) = opts.client else {
-        anyhow::bail!("collect --live requires ADSBX_API_KEY or RAPIDAPI_KEY");
-    };
-    let hexes: Vec<String> = fleet.rows.iter().map(|r| r.icao24.clone()).collect();
-    let mut tracker = LiveTracker::new(&fleet.rows);
-    let mut polls = 0u32;
-    loop {
-        polls += 1;
-        report.live_polls += 1;
-        let fetched_at = utc_iso(Utc::now());
-        match client.fetch_live_batch(&hexes).await? {
-            FetchOutcome::Ok { body } => {
-                let samples = parse_live_aircraft(&body)?;
-                let trips = tracker.ingest(&samples, Utc::now());
-                for t in trips {
-                    db.upsert_trip(&live_trip_row(&t, &airports, &fetched_at))?;
-                    report.live_trips += 1;
-                    report.trips_upserted += 1;
-                }
-            }
-            other => {
-                if let Some(msg) = other.error_message() {
-                    warn!(%msg, "live poll failed");
-                    if !other.advances_cursor() {
-                        for h in &hexes {
-                            db.set_cursor_error(h, &msg)?;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        if opts.max_polls.map(|m| polls >= m).unwrap_or(false) {
-            break;
-        }
-        tokio::time::sleep(opts.poll_interval).await;
-    }
-    let today = default_today_utc();
-    for row in &fleet.rows {
-        db.advance_cursor_ok(&row.icao24, today)?;
-        report.days_ok += 1;
-    }
-    Ok(report)
-}
-
-/// Used by tests: process already-cached traces for a date range (no HTTP).
-pub async fn collect_from_cache(
-    mapping_sqlite: &Path,
-    journal_sqlite: &Path,
-    cache_dir: &Path,
-    airports_csv: Option<&Path>,
-    from: NaiveDate,
-    to: NaiveDate,
-) -> Result<CollectReport> {
-    collect(CollectOptions {
-        mapping_sqlite: mapping_sqlite.to_path_buf(),
-        journal_sqlite: journal_sqlite.to_path_buf(),
-        cache_dir: cache_dir.to_path_buf(),
-        airports_csv: airports_csv.map(|p| p.to_path_buf()),
-        from: Some(from),
-        to: Some(to),
-        live: false,
-        poll_interval: Duration::from_secs(1),
-        max_polls: None,
-        client: None,
-        allow_hist: false,
-        allow_recent: false,
-        source: CollectSource::AdsBx,
-        opensky: None,
-        max_flights_credits: DEFAULT_MAX_FLIGHTS_CREDITS,
-        tracks_fallback: true,
-        hex_filter: Vec::new(),
-    })
-    .await
+    collect_opensky(opts, fleet, db, airports).await
 }
 
 pub async fn watch_opensky(
@@ -685,10 +289,11 @@ pub fn collapse_near_duplicate_flights(flights: &[Flight]) -> Vec<Flight> {
         .collect()
 }
 
-fn flight_completeness(f: &Flight) -> (u8, u8, i64) {
+fn flight_completeness(f: &Flight) -> (u8, u8, u8, i64) {
     let dep = u8::from(f.est_departure_airport.is_some());
     let arr = u8::from(f.est_arrival_airport.is_some());
-    (dep + arr, arr, -f.first_seen)
+    let cs = u8::from(f.callsign.is_some());
+    (dep + arr, arr, cs, -f.first_seen)
 }
 
 /// Map already-fetched OpenSky flights into `trips` (no HTTP). Used by collect and tests.
@@ -705,7 +310,7 @@ pub fn ingest_opensky_flights(
     let mut skipped = 0u64;
     for f in &flights {
         let has_airports = f.est_departure_airport.is_some() || f.est_arrival_airport.is_some();
-        let track = tracks.get(&f.first_seen).copied();
+        let track = tracks.get(&f.first_seen).cloned();
         let source = if has_airports && track.is_none() {
             TripSource::OpenskyFlights
         } else if track.is_some() && !has_airports {
@@ -731,7 +336,7 @@ async fn collect_opensky(
     airports: AirportIndex,
 ) -> Result<CollectReport> {
     let Some(client) = opts.opensky.clone() else {
-        anyhow::bail!("collect --source opensky requires OPENSKY_CLIENT_ID/SECRET or OPENSKY_CREDENTIALS_JSON");
+        anyhow::bail!("collect requires OPENSKY_CLIENT_ID/SECRET or OPENSKY_CREDENTIALS_JSON");
     };
     collect_opensky_with(&*client, &opts, fleet, db, airports).await
 }
@@ -809,7 +414,7 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
             let cache_path = flights_all_slice_cache_path(&opts.cache_dir, date, slice_idx);
             let tracks_path = flights_all_tracks_cache_path(&opts.cache_dir, date, slice_idx);
             let (mut flights, from_cache) = if cache_path.exists() {
-                let raw = read_trace_cache(&cache_path)?;
+                let raw = read_gzip_cache(&cache_path)?;
                 (crate::opensky::parse_flights(&raw)?, true)
             } else {
                 if report
@@ -841,7 +446,7 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
                         );
                         let filtered = filter_flights_to_fleet(&data, &cache_hexes);
                         let json = serde_json::to_vec(&filtered)?;
-                        write_trace_cache(&cache_path, &json)?;
+                        write_gzip_cache(&cache_path, &json)?;
                         (filtered, false)
                     }
                     (OpenskyOutcome::NotFound { credit }, ..) => {
@@ -851,7 +456,7 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
                             remaining = ?credit.remaining,
                             "opensky flights/all 404"
                         );
-                        write_trace_cache(&cache_path, b"[]")?;
+                        write_gzip_cache(&cache_path, b"[]")?;
                         report.days_not_found += 1;
                         (Vec::new(), false)
                     }
@@ -891,8 +496,8 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
             )
             .await?
             {
-                SliceHalt::Stop => {
-                    db.set_flights_all_error(date, "tracks halted slice")?;
+                SliceHalt::Stop(msg) => {
+                    db.set_flights_all_error(date, &msg)?;
                     return Ok(report);
                 }
                 SliceHalt::Continue => {}
@@ -918,7 +523,7 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
 
 enum SliceHalt {
     Continue,
-    Stop,
+    Stop(String),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -958,7 +563,7 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
                 let key = track_attempt_key(&hex, f.first_seen);
                 if let Some(cached) = tracks_cache.get(&key) {
                     if let Some(ends) = cached {
-                        tracks.insert(f.first_seen, *ends);
+                        tracks.insert(f.first_seen, ends.clone());
                     }
                     continue;
                 }
@@ -967,7 +572,7 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
                     OpenskyOutcome::Ok {
                         data: Some(ends), ..
                     } => {
-                        tracks.insert(f.first_seen, ends);
+                        tracks.insert(f.first_seen, ends.clone());
                         tracks_cache.insert(key, Some(ends));
                         write_tracks_cache(tracks_cache_path, &tracks_cache)?;
                     }
@@ -979,18 +584,16 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
                         let msg = format!("tracks HTTP 429 remaining={:?}", credit.remaining);
                         warn!(%hex, %msg);
                         write_tracks_cache(tracks_cache_path, &tracks_cache)?;
-                        db.set_cursor_error(&hex, &msg)?;
                         report.hexes_stopped_on_error += 1;
-                        return Ok(SliceHalt::Stop);
+                        return Ok(SliceHalt::Stop(msg));
                     }
                     OpenskyOutcome::Denied { status, message }
                     | OpenskyOutcome::Other { status, message } => {
                         let msg = format!("tracks HTTP {status}: {message}");
                         warn!(%hex, %msg);
                         write_tracks_cache(tracks_cache_path, &tracks_cache)?;
-                        db.set_cursor_error(&hex, &msg)?;
                         report.hexes_stopped_on_error += 1;
-                        return Ok(SliceHalt::Stop);
+                        return Ok(SliceHalt::Stop(msg));
                     }
                 }
             }
@@ -1024,31 +627,19 @@ pub fn print_status(status: &crate::store::JournalStatus, fleet: Option<&FleetQu
     for (d, n) in &status.flights_all_incomplete {
         println!("  flights_all in progress {d}: {n}/12 slices");
     }
-    println!("trips: {}", status.trips);
-    println!(
-        "fetch_cursor (ADSBX / leftover): {} (errors {}) last_ok {} .. {}",
-        status.cursors,
-        status.cursors_with_error,
-        status.last_ok_min.as_deref().unwrap_or("—"),
-        status.last_ok_max.as_deref().unwrap_or("—"),
-    );
-    for (hex, err) in &status.errors {
-        println!("  error {hex}: {err}");
+    for (d, err) in &status.flights_all_errors {
+        println!("  flights_all error {d}: {err}");
     }
+    println!("trips: {}", status.trips);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opensky::DEFAULT_MAX_FLIGHTS_CREDITS;
 
     #[test]
     fn cache_path_layout() {
-        let p = trace_cache_path(
-            Path::new("cache"),
-            NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
-            "abcdef",
-        );
-        assert_eq!(p, PathBuf::from("cache/traces/2024-01-15/abcdef.json.gz"));
         let s = flights_all_slice_cache_path(
             Path::new("cache"),
             NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
@@ -1121,6 +712,21 @@ mod tests {
         assert_eq!(kept.len(), 1);
     }
 
+    #[test]
+    fn collapse_prefers_callsign_when_airports_tie() {
+        let flights = crate::opensky::parse_flights(
+            br#"[
+              {"icao24":"abcdef","firstSeen":100,"lastSeen":200,"estDepartureAirport":"KAPA","estArrivalAirport":"KJFK"},
+              {"icao24":"abcdef","firstSeen":110,"lastSeen":210,"estDepartureAirport":"KAPA","estArrivalAirport":"KJFK","callsign":"DCM1"}
+            ]"#,
+        )
+        .unwrap();
+        let kept = collapse_near_duplicate_flights(&flights);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].callsign.as_deref(), Some("DCM1"));
+        assert_eq!(kept[0].first_seen, 110);
+    }
+
     fn fleet_row(hex: &str) -> FleetRow {
         FleetRow {
             n_number: format!("N{hex}"),
@@ -1157,13 +763,6 @@ mod tests {
             airports_csv: None,
             from: Some(date),
             to: Some(date),
-            live: false,
-            poll_interval: Duration::from_secs(1),
-            max_polls: None,
-            client: None,
-            allow_hist: false,
-            allow_recent: false,
-            source: CollectSource::Opensky,
             opensky: None,
             max_flights_credits: DEFAULT_MAX_FLIGHTS_CREDITS,
             tracks_fallback,
@@ -1341,7 +940,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.flights_calls, 12);
         assert_eq!(r.trips_upserted, 1);
-        let raw = read_trace_cache(&flights_all_slice_cache_path(&cache, date, 0)).unwrap();
+        let raw = read_gzip_cache(&flights_all_slice_cache_path(&cache, date, 0)).unwrap();
         let cached = crate::opensky::parse_flights(&raw).unwrap();
         assert_eq!(cached.len(), 2, "--hex must not shrink the slice cache");
         let db = JournalDb::open(&journal).unwrap();
@@ -1395,10 +994,11 @@ mod tests {
             dep_lon: -104.67,
             arr_lat: 40.64,
             arr_lon: -73.78,
+            callsign: None,
         };
         let mut script = std::collections::VecDeque::new();
         script.push_back(OpenskyOutcome::Ok {
-            data: Some(ends),
+            data: Some(ends.clone()),
             credit: tracks_credit(),
         });
         script.push_back(OpenskyOutcome::RateLimited {
@@ -1505,5 +1105,18 @@ mod tests {
             "tracks Other must not mark the slice complete"
         );
         assert!(!db.flights_all_day_complete(date, 12).unwrap());
+        assert!(
+            db.get_cursor("abcdef").unwrap().is_none(),
+            "tracks errors must not write leftover fetch_cursor"
+        );
+        let st = db.status(&journal).unwrap();
+        assert_eq!(st.flights_all_errors.len(), 1);
+        assert!(
+            st.flights_all_errors[0]
+                .1
+                .contains("tracks HTTP 0: timeout"),
+            "{:?}",
+            st.flights_all_errors
+        );
     }
 }

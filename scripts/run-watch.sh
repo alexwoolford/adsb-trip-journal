@@ -28,4 +28,4 @@ exec "$BIN" \
   --journal-sqlite "$JOURNAL" \
   --data-dir "$STATE" \
   --cache-dir "$CACHE" \
-  watch --source opensky --interval-secs "$INTERVAL"
+  watch --interval-secs "$INTERVAL"

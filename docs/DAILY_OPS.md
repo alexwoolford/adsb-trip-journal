@@ -17,7 +17,7 @@ OpenSky Standard REST: **4,000 credits/day per independent bucket** (states / fl
 
 404 on `/flights/all` for a 2h global window is rare (empty interval). 429 does not mark remaining slices complete. Registrant is not operator. Coverage is thinner than ADS-B Exchange (no MLAT).
 
-Do **not** run `probe --opensky` or extra `collect --hex` on the production host without a reason (those spend the flights bucket). `probe --opensky --flights-all` is a one-shot measurement (one 2h slice).
+Do **not** run `probe --opensky --flights-all` or extra `collect --hex` on the production host without a reason (those spend the flights bucket). `probe --opensky --flights-all` is a one-shot measurement (one 2h slice). Do not call `/flights/aircraft`.
 
 ## Deploy (systemd)
 
@@ -94,8 +94,8 @@ TAIL_TO_TICKER_SQLITE=/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite
 ## Credit budget
 
 - Watch: ~**20** states-credits/poll × 144 ≈ **2,880**/day of the 4,000 **states** bucket (icao24 filter is 4/call × 5 chunks for a ~331-hex fleet). Independent of flights. Optional; collect does not spend this.
-- Collect: **12 × `/flights/all`** per UTC day of the **flights** bucket (**30**/slice measured 2026-09-03 = **360**/day). Host cap **3600** (CLI/laptop **800**). After yesterday, leftover credits fill never-started or incomplete days in a **90-day** window (oldest first). When that window is 12/12, leftover credits stay unused. `--hex` does not shrink the cache.
-- Tracks fallback only when both airport estimates are missing (tracks bucket). Successful (and empty) `/tracks` attempts are cached per slice so a 429 resume does not re-call the same `icao24+firstSeen`.
+- Collect: **12 × `/flights/all`** per UTC day of the **flights** bucket (**30**/slice measured 2026-09-03 = **360**/day). Host cap **3600** (CLI/laptop **800**). After yesterday, leftover credits fill never-started or incomplete days in a **90-day** window (oldest first). When that window is 12/12, leftover credits stay unused. `--hex` does not shrink the cache. Ingest keeps the full FlightObject on mapped rows: `callsign` (label, often null) plus airport-estimate quality integers. Existing complete days are not re-fetched to backfill those columns.
+- Tracks fallback only when both airport estimates are missing (tracks bucket). Successful (and empty) `/tracks` attempts are cached per slice so a 429 resume does not re-call the same `icao24+firstSeen`. Track `callsign` fills the trip only when the FlightObject had none.
 
 ## Limits
 

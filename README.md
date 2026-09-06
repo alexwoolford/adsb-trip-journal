@@ -19,58 +19,36 @@ adsb-trip-journal  →  data/trips.sqlite + cache/flights_all/…
 
 ## Access reality (read this first)
 
-**Feeding an ADS-B Exchange receiver does not grant the REST API.** The feeder UUID identifies the station for stats/MLAT. It is not `api-auth`. Documented feeder perks are map layers, not historical traces.
+**Production is OpenSky Standard REST.** Feeding an ADS-B Exchange receiver does not grant a traces API and is not this collector. Do not scrape `globe.adsbexchange.com`.
 
 | Product | What you get | Fits this collector? |
 |---|---|---|
-| Feeder UUID | Map extras, feeder stats | No programmatic traces |
-| Community API (RapidAPI, ~$10/mo, 10k req) | Live positions, **non-commercial** | Forward-only if licensed |
-| Enterprise traces / S3 | Per-hex daily `trace_full_{icao24}.json` | Preferred backfill |
-| Daily Flight Events Blend | Origin→destination CSV | Ideal; not assumed |
 | **OpenSky REST** | Estimated origin/dest + timestamps; thinner coverage, no MLAT, no Trino dump | Yes — Standard 4,000 credits/day **per bucket** |
+| Feeder UUID / ADSBX community API | Map extras or live positions | No |
 
-ADSBX’s FAQ: a project for a commercial entity needs a commercial license even if you are not selling the output. Alternative-data / investment research is likely commercial. Do not scrape `globe.adsbexchange.com` as a substitute.
+**Probe** is a one-shot credit measurement: `adsb-trip-journal probe --opensky --flights-all` (one 2h `GET /flights/all`). Do **not** call `/flights/aircraft` (30 credits per hex-day). 401/402/403/429 are not success. OpenSky REST accumulates a journal one UTC day at a time.
 
-**Probe before backfill.** `adsb-trip-journal probe` records HTTP status for live hex → recent trace → one historical day. `adsb-trip-journal probe --opensky` records an OAuth token check, `/states/all`, `/flights/aircraft`, unix `begin`/`end`, and remaining-credit delta. `probe --opensky --flights-all` measures one 2h `GET /flights/all` (bytes, elapsed, remaining-credit delta, fleet overlap vs existing trips). A 404 (no legs that day) is success for the cursor. 401/402/403/429 are not. If ADSBX history is paywalled, v1 is **forward-only** on that source; OpenSky REST still accumulates a journal one UTC day at a time (no Trino dump).
-
-Access probe (OpenSky, 2026-09-01, this tree):
+Access notes (this account):
 
 ```
-token ok
-historical /flights/aircraft = 30 flights-credits per call
-  (full UTC day and a 6h 12:00–18:00 slice both spent 30 — “Live / < 24 h = 4” is not this path)
-gold-set 2026-08-31 --hex CAT/COST/JPM/XOM/CVX:
-  6 trip rows (3 complete ICAO pairs + 3 near-duplicates missing arr_airport)
-  COST + JPM 404; WMT probe earlier the same day also 404
-  404 ≠ did not fly
+historical /flights/aircraft = 30 flights-credits per call (unused by collect)
+a 2h /flights/all slice is also 30 — a UTC day is 12 × 30 = 360
+gold-set 2026-08-31 --hex CAT/COST/JPM/XOM/CVX: complete pairs XOM/CVX/CAT; COST+JPM 404
+404 ≠ did not fly
 ```
-
-If you only have RapidAPI live: batch the fleet into one `/icao/{hex,hex,…}` per poll. Hundreds of per-hex requests will exhaust a 10k/month quota immediately.
 
 ## Build
 
 ```bash
 cargo build --release
 export TAIL_TO_TICKER_SQLITE="../tail-to-ticker/data/current/tail_to_ticker.sqlite"
-# optional: ADSBX_API_KEY=…
-./target/release/adsb-trip-journal probe
-./target/release/adsb-trip-journal probe --opensky
+./target/release/adsb-trip-journal probe --opensky --flights-all
 ./target/release/adsb-trip-journal airports-fetch
 ./target/release/adsb-trip-journal collect --from 2024-01-15 --to 2024-01-15
 ./target/release/adsb-trip-journal status
 ```
 
-Default `--source` is **opensky** (production). `--source adsbx` is non-prod: cache/tests, or traces you already have a license to store. Do not treat ADSBX as the host collector.
-
-Cached ADSBX traces under `cache/traces/YYYY-MM-DD/{icao24}.json.gz` are processed with `--source adsbx` even without an API key (the test path).
-
 `--from` defaults to the oldest incomplete or never-started `/flights/all` UTC day inside a **90-day** repair window (incomplete slice rows older than that still resume), else yesterday UTC. Watch `seen_airborne` does not pull collect start backward. There is no unbounded multi-year loop.
-
-Live fallback (ADSBX only, if live works and traces do not):
-
-```bash
-./target/release/adsb-trip-journal collect --source adsbx --live --poll-interval-secs 300
-```
 
 ## OpenSky collector
 
@@ -84,7 +62,7 @@ Watch still polls `/states/all` and writes `seen_airborne`. Collect is **not** g
 |---|---|---|
 | `GET /states/all?icao24=…` (hex filter, no huge bbox) | Who in the fleet is on the network **now** (watch; not a collect gate) | **4** per request. Watch chunks 80 hexes → ~20 credits/poll for ~331 hexes |
 | `GET /flights/all` 2h historical slice | All flights seen in the window; we keep mapped hexes | **30** (measured 2026-09-03 12:00–14:00 UTC: 200, ~2.3MB, 2.6s; remaining dropped to match a 30-credit call after that day’s `/flights/aircraft` collect) |
-| `GET /flights/aircraft` historical UTC day | Completed legs for one hex | **30** (not used by daily collect) |
+| `GET /flights/aircraft` historical UTC day | Completed legs for one hex | **30** — unused; do not probe this |
 | `GET /tracks/all?icao24=&time=` | Sparse waypoints when airport estimates cannot be placed | tracks bucket |
 
 Gold-set collect (`--hex` CAT `a12c04`, COST `ab2ec9`, JPM `a7cb30`, XOM `a004b4`, CVX `a15de5` on 2026-08-31): complete pairs XOM LEBL→OTBD, CVX KSGR→KSNS, CAT KOAK→KBUR (COST/JPM 404). OpenSky often emits a second FlightObject a few seconds later with a null arrival ident; ingest now **collapses** those within 180s and keeps the complete ICAO pair. Mapping isolation holds; registrant for N175CT is Caterpillar Inc, matching ticker CAT. Missing day = not received, not “did not fly.” Coverage is thinner than ADS-B Exchange (fewer sensors, **no MLAT**).
@@ -137,25 +115,27 @@ Empty `icao24` rows are skipped and counted. OEM / lessor fleets (`aviation_issu
 
 ## Journal schema
 
-SQLite at `$TRIP_JOURNAL_SQLITE` (default `data/trips.sqlite`): `fleet_snapshot`, `trips`, `fetch_cursor` (ADSBX), `seen_airborne` (watch diagnostic), `flights_all_slice`, `flights_all_day`. OpenSky resume is `flights_all` 12/12, not per-hex `fetch_cursor`. See [`context/adsb-trip-journal-spec.md`](context/adsb-trip-journal-spec.md). `trips.source` is `opensky_flights` or `opensky_track` (or `adsbx_*` when using `--source adsbx`).
+SQLite at `$TRIP_JOURNAL_SQLITE` (default `data/trips.sqlite`): `fleet_snapshot`, `trips`, `seen_airborne` (watch diagnostic), `flights_all_slice`, `flights_all_day`. OpenSky resume is `flights_all` 12/12 (`flights_all_day.last_error` on halt). `trips.source` is `opensky_flights` or `opensky_track`.
 
 Analyst query:
 
 ```sql
-SELECT dep_ts, arr_ts, dep_airport, arr_airport, n_number, ticker
+SELECT dep_ts, arr_ts, dep_airport, arr_airport, n_number, ticker, callsign
 FROM trips
 WHERE ticker = '…'
 ORDER BY dep_ts;
 ```
 
+`callsign` is the OpenSky transponder label (sparse; not identity). Airport-estimate quality integers (`dep_airport_horiz_m` and siblings) come from the same FlightObject. Days already 12/12 before this column existed stay null; do not re-GET them.
+
 Ticker/cik on a trip row are a **snapshot at fetch time**. Re-running a day is idempotent (`PRIMARY KEY (icao24, dep_ts)`).
 
 ## Honesty
 
-- **ADS-B Exchange ToS** apply. Community API is typically personal / non-commercial.
+- **Do not scrape** ADS-B Exchange globe tiles or treat a feeder UUID as an API key.
 - **Registrant ≠ owner ≠ operator.** A row means this N-number, then mapped to this ticker, was observed here. It is not proof the CEO flew there.
 - **LADD / PIA:** missing days are missing, not “did not fly.”
-- **Do not redistribute** raw ADSBX traces if the license forbids it. Keep this store separate from the FAA/SEC mapping feed.
+- Keep this store separate from the FAA/SEC mapping feed.
 - This journal is **not investment advice.**
 
 ## v2 (not this repo’s default path)

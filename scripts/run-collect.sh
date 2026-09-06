@@ -52,5 +52,5 @@ echo "bin=$BIN mapping=$MAPPING max_flights_credits=$MAX_CREDITS"
   --journal-sqlite "$JOURNAL" \
   --data-dir "$STATE" \
   --cache-dir "$CACHE" \
-  collect --source opensky --max-flights-credits "$MAX_CREDITS"
+  collect --max-flights-credits "$MAX_CREDITS"
 echo "journal → $JOURNAL"

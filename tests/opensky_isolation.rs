@@ -1,4 +1,4 @@
-//! OpenSky ingest: mapping DB isolation, airport ident lookup, 404 vs 429 cursor.
+//! OpenSky ingest: mapping DB isolation, airport ident lookup, leftover fetch_cursor APIs.
 
 use std::collections::HashMap;
 use std::fs;
@@ -107,6 +107,8 @@ fn mapping_sqlite_unchanged_after_opensky_ingest() {
     assert_eq!(trip.arr_airport.as_deref(), Some("KJFK"));
     assert_eq!(trip.ticker, "AAA");
     assert_eq!(trip.source, "opensky_flights");
+    assert_eq!(trip.callsign.as_deref(), Some("TEST1"));
+    assert_eq!(trip.dep_airport_horiz_m, Some(100));
 
     let size_after = fs::metadata(&mapping).unwrap().len();
     let count_after: i64 = {
@@ -173,6 +175,7 @@ fn ingest_uses_track_when_airports_null() {
             dep_lon: -104.67,
             arr_lat: 40.64,
             arr_lon: -73.78,
+            callsign: Some("N1".into()),
         },
     );
     let (up, skip) = ingest_opensky_flights(
@@ -189,6 +192,7 @@ fn ingest_uses_track_when_airports_null() {
     let trip = db.get_trip(HEX, "2024-01-15T00:00:00Z").unwrap().unwrap();
     assert_eq!(trip.source, "opensky_track");
     assert!(trip.dep_airport.is_none());
+    assert_eq!(trip.callsign.as_deref(), Some("N1"));
 }
 
 #[test]

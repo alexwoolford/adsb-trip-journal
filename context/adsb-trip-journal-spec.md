@@ -18,8 +18,6 @@ sibling: fleet query  →  OpenSky GET /flights/all (12× 2h)  →  trip journal
 sibling data/trips.sqlite + cache/flights_all/YYYY-MM-DD/{00-11}.json.gz
 ```
 
-ADSBX traces (`--source adsbx`) are optional / cache / tests, not the production collector.
-
 Join key is **`icao24`** (lowercase 24-bit hex from FAA MASTER), not the N-number. ADS-B radios broadcast the hex; the N-number is a registry label copied onto trip rows for humans.
 
 ---
@@ -52,7 +50,6 @@ Two processes, two databases, one env pointer.
 | Mapping feed (producer) | `$TAIL_TO_TICKER_SQLITE` default `…/tail-to-ticker/data/current/tail_to_ticker.sqlite` | **read-only** |
 | Trip journal (this sibling) | `$TRIP_JOURNAL_SQLITE` default `data/trips.sqlite` | read/write |
 | OpenSky slice cache | `cache/flights_all/YYYY-MM-DD/{00-11}.json.gz` | write; fleet-filtered `/flights/all` body (not `--hex` filtered) |
-| ADSBX traces (optional) | `cache/traces/YYYY-MM-DD/{icao24}.json.gz` | `--source adsbx` only |
 
 Daily loop (conceptual):
 
@@ -60,7 +57,7 @@ Daily loop (conceptual):
 2. Upsert `fleet_snapshot` (copy of keys + ticker/cik as of this run).
 3. Cover yesterday UTC with twelve `GET /flights/all` 2-hour slices, then leftover flights credits fill never-started or incomplete days in a **90-day** repair window (oldest first). Filter to the mapped fleet, persist the **full fleet** slice JSON, then ingest (`--hex` only restricts ingest). Incomplete `flights_all_slice` rows older than the window still resume. Watch `seen_airborne` is not a gate and does not pull `--from` backward.
 4. When neither airport ident places, optionally `GET /tracks` and cache the attempt beside the slice. Missing arrival stays missing (do not copy dep lat/lon onto arr).
-5. Mark a UTC day complete only after 12/12 unfiltered ingest. Do not bulk-write per-hex `fetch_cursor` for OpenSky. Never open the mapping DB for write.
+5. Mark a UTC day complete only after 12/12 unfiltered ingest. Never open the mapping DB for write.
 
 If parquet is easier than SQLite for the mapping side, the same columns exist on `data/current/tail_to_ticker.parquet`. Prefer SQLite so the filter SQL in §3 is the contract.
 
@@ -145,8 +142,15 @@ CREATE TABLE trips (
   arr_airport TEXT,
   dep_place TEXT,                -- ident or "lat,lon" for display
   arr_place TEXT,
-  source TEXT NOT NULL,          -- opensky_flights | opensky_track | adsbx_trace_hist | adsbx_trace_recent | adsbx_live
+  source TEXT NOT NULL,          -- opensky_flights | opensky_track
   fetched_at TEXT NOT NULL,      -- UTC instant YYYY-MM-DDTHH:MM:SSZ
+  callsign TEXT,                 -- OpenSky transponder label; sparse; not identity
+  dep_airport_horiz_m INTEGER,   -- OpenSky airport-estimate quality (meters / counts)
+  dep_airport_vert_m INTEGER,
+  arr_airport_horiz_m INTEGER,
+  arr_airport_vert_m INTEGER,
+  dep_airport_candidates INTEGER,
+  arr_airport_candidates INTEGER,
   PRIMARY KEY (icao24, dep_ts)
 );
 CREATE INDEX idx_trips_ticker_dep ON trips (ticker, dep_ts);
@@ -155,22 +159,13 @@ CREATE INDEX idx_trips_n_number ON trips (n_number);
 
 Ticker/cik on the trip row are a **snapshot at fetch time**. If the mapping later moves the tail to another ticker, old trip rows stay as fetched. Do not rewrite history from a new map.
 
-### `fetch_cursor`
+`callsign` is what the transponder transmitted (often an N-number, sometimes `DCM`/`FFL` or airline-style). It is **not** a join key and is often null. The six integer columns are OpenSky’s airport-estimate metadata (horizontal/vertical distance in meters and nearby-candidate counts). Existing complete `/flights/all` days stay null until a slice is fetched again.
 
-Restartable backfill / increment.
+### `fetch_cursor` (leftover)
 
-```sql
-CREATE TABLE fetch_cursor (
-  icao24 TEXT PRIMARY KEY,
-  last_ok_date TEXT,             -- last UTC date YYYY-MM-DD with a successful fetch (incl. 404 = no trace)
-  last_error TEXT,
-  updated_at TEXT NOT NULL       -- UTC instant YYYY-MM-DDTHH:MM:SSZ
-);
-```
+The table may still exist on a journal that once ran ADSBX collect. OpenSky does not write it. Status does not print it. Do not wipe the host sqlite to drop it.
 
-A successful **404** (no trace that day) still advances `last_ok_date`. HTTP 401/402/403/429 must **not** advance the cursor.
-
-`fetch_cursor` is the ADSBX per-hex resume model. OpenSky daily collect is **not** per-hex `/flights/aircraft`. It runs twelve `GET /flights/all` 2-hour slices, filters to the mapped fleet, and marks the UTC day complete only after 12/12. Status leads with `flights_all` 12/12. Do not bulk-advance per-hex `last_ok_date` when an OpenSky day completes.
+OpenSky daily collect is **not** per-hex `/flights/aircraft`. It runs twelve `GET /flights/all` 2-hour slices, filters to the mapped fleet, and marks the UTC day complete only after 12/12. Status leads with `flights_all` 12/12 (`flights_all_day.last_error` on halt). Do not bulk-advance per-hex `last_ok_date` when an OpenSky day completes.
 
 ### `flights_all_slice` / `flights_all_day`
 
@@ -192,30 +187,7 @@ CREATE TABLE flights_all_day (
 
 ## 5. Trip segmentation
 
-**Production (OpenSky):** each `/flights/all` FlightObject is one candidate leg (`firstSeen` / `lastSeen`, estimated airport idents). Collapse near-duplicates within 180s and keep the most complete ICAO pair. Place dep/arr from OurAirports idents; if neither ident places, optional `/tracks` first/last point. Missing arrival stays null — do not invent A→A by copying departure coordinates. Do not emit a trip with no departure coordinates.
-
-**Optional (`--source adsbx`):** prefer ADS-B Exchange **per-aircraft daily traces** over polling live positions.
-
-Trace file (conceptual): `timestamp` (unix seconds, start of day) plus `trace[]` rows:
-
-`[seconds_after_timestamp, lat, lon, altitude_ft_or_"ground"|null, gs, track, flags, …]`
-
-**`flags & 2`**: start of a new leg (their split between landing and subsequent takeoff). That bit is the primary trip boundary.
-
-Additional heuristics if flags are missing or noisy:
-
-- Altitude `"ground"` or near-zero AGL with gs below a taxi threshold: on ground.
-- A new airborne segment after a ground dwell longer than ~15 minutes: new trip.
-- Ignore isolated points and stale flags (`flags & 1`) when picking dep/arr coordinates.
-
-For each leg:
-
-- **Departure**: first airborne (or first point after a new-leg flag) with a valid lat/lon; `dep_ts = timestamp + seconds`.
-- **Arrival**: last point of that leg before the next new-leg flag or end of file; if the aircraft is still airborne at UTC midnight, leave `arr_ts` null and merge with the next day’s first leg when the same hex continues.
-
-Do not emit a trip with no coordinates. Short hops that never leave the same airport still count (same `dep_airport` and `arr_airport`).
-
-Live-poll fallback (if traces are unavailable): treat “was on ground / missing, then airborne, then on ground” as a trip. Quality will be worse; set `source = adsbx_live`.
+Each `/flights/all` FlightObject is one candidate leg (`firstSeen` / `lastSeen`, estimated airport idents). Collapse near-duplicates within 180s and keep the most complete ICAO pair (prefer a non-null `callsign` after airport completeness). Place dep/arr from OurAirports idents; if neither ident places, optional `/tracks` first/last point. Missing arrival stays null — do not invent A→A by copying departure coordinates. Do not emit a trip with no departure coordinates. Short hops that never leave the same airport still count (same `dep_airport` and `arr_airport`).
 
 ---
 
@@ -240,13 +212,11 @@ v1 does not reverse-geocode to city names. Place names can be joined later from 
 | OpenSky `GET /flights/all` 2h | All flights in the window; we keep mapped hexes | **Nightly collect** (12 slices/UTC day; historical slice billed **30** on this account) |
 | OpenSky `GET /tracks/all` | Sparse waypoints | Fallback when airport idents cannot be placed |
 | OpenSky `GET /states/all` | Who is on the network now | Optional watch; not a collect gate |
-| OpenSky `GET /flights/aircraft` | Completed legs for one hex | Probe / unused by daily collect (30/call, cannot cover a busy fleet) |
-| Community / RapidAPI live | Current positions by hex | ADSBX forward collection if licensed (`--source adsbx --live`) |
-| ADSBX recent/historical trace | Per-hex daily JSON | Optional `--source adsbx`; cache/tests |
+| OpenSky `GET /flights/aircraft` | Completed legs for one hex | **Unused** (30/call, cannot cover a busy fleet). Do not probe it. |
 
-**First implementer task:** `probe --opensky` then `probe --opensky --flights-all`. Record remaining-credit delta. If ADSBX history is paywalled, that source is **forward-only**; OpenSky REST still accumulates a journal one UTC day at a time (no Trino dump).
+**First implementer task:** `probe --opensky --flights-all` (one 2h slice). Record remaining-credit delta. OpenSky REST accumulates a journal one UTC day at a time (no Trino dump).
 
-Credentials: environment only (`OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`, or `ADSBX_API_KEY`). Never commit keys. Never put them in tail-to-ticker.
+Credentials: environment only (`OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`, or `OPENSKY_CREDENTIALS_JSON`). Never commit keys. Never put them in tail-to-ticker.
 
 Credit cap: CLI/laptop **800** flights-credits per collect run (two UTC days at 30/slice). Production host env **3600** (repair budget; ~10 days/run). Install does not overwrite an existing env file. Lookback is **90** UTC days of never-started or incomplete `/flights/all` days.
 
@@ -258,10 +228,10 @@ Gzip: historical JSON is often gzip without a `.gz` name; clients must send `Acc
 
 ## 8. Legal and honesty
 
-- **ADS-B Exchange ToS** apply. Community API is typically personal / non-commercial. Alternative-data use for investment research is likely **commercial**; do not assume a feeder UUID is a commercial license. Pay or get written permission before treating this as a product.
+- **Do not scrape** ADS-B Exchange globe tiles or treat a feeder UUID as an API key. This collector uses OpenSky REST only.
 - **Registrant ≠ owner ≠ operator.** A trip journal on a published mapping is “this N-number, currently mapped to this ticker, was observed here.” It is not proof the CEO flew there or that a deal is happening.
-- **LADD / PIA:** some tails are blocked on FAA-fed sites. ADS-B Exchange is independent of those lists, but coverage is still receiver-limited. Missing days are missing, not “did not fly.”
-- **Do not redistribute** raw ADSBX traces if the license forbids it. The mapping feed’s FAA/SEC data is a different license stack; keep the stores separate.
+- **LADD / PIA:** some tails are blocked on FAA-fed sites. OpenSky coverage is receiver-limited and has no MLAT. Missing days are missing, not “did not fly.”
+- The mapping feed’s FAA/SEC data is a different license stack; keep the stores separate.
 - This journal is **not investment advice**.
 
 ---
@@ -272,7 +242,7 @@ v1 is done when all of the following are true:
 
 1. Sibling repo (or local tree) reads mapping SQLite **read-only** via `TAIL_TO_TICKER_SQLITE`.
 2. Fleet query in §3 is the default input; empty `icao24` rows are skipped and counted.
-3. For OpenSky collect, `flights_all_slice` has 12/12 rows for every UTC day in the attempted window (401/429 do not mark remaining slices). Status leads with that 12/12. ADSBX collect still uses per-hex `last_ok_date` (including documented 404s).
+3. For OpenSky collect, `flights_all_slice` has 12/12 rows for every UTC day in the attempted window (401/429 do not mark remaining slices). Status leads with that 12/12. Halt errors live on `flights_all_day.last_error`.
 4. `trips` contains one row per segmented completed leg with `dep_ts`, coordinates, and airport snap when in radius.
 5. Re-running a day is idempotent (`PRIMARY KEY (icao24, dep_ts)`).
 6. Mapping SQLite file size and `mappings_current` row count are unchanged after a sibling run.
@@ -281,7 +251,7 @@ v1 is done when all of the following are true:
 Analyst query the journal is meant to support (v1 data, v2 product):
 
 ```sql
-SELECT dep_ts, arr_ts, dep_airport, arr_airport, n_number, ticker
+SELECT dep_ts, arr_ts, dep_airport, arr_airport, n_number, ticker, callsign
 FROM trips
 WHERE ticker = '…'
 ORDER BY dep_ts;

@@ -183,7 +183,7 @@ impl<T> OpenskyOutcome<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct Flight {
     pub icao24: String,
     #[serde(rename = "firstSeen")]
@@ -194,32 +194,32 @@ pub struct Flight {
     pub est_departure_airport: Option<String>,
     #[serde(rename = "estArrivalAirport", default)]
     pub est_arrival_airport: Option<String>,
+    /// Transponder label (often N-number, sometimes DCM/FFL). Not identity.
+    #[serde(default)]
+    pub callsign: Option<String>,
+    #[serde(rename = "estDepartureAirportHorizDistance", default)]
+    pub est_departure_airport_horiz_distance: Option<i64>,
+    #[serde(rename = "estDepartureAirportVertDistance", default)]
+    pub est_departure_airport_vert_distance: Option<i64>,
+    #[serde(rename = "estArrivalAirportHorizDistance", default)]
+    pub est_arrival_airport_horiz_distance: Option<i64>,
+    #[serde(rename = "estArrivalAirportVertDistance", default)]
+    pub est_arrival_airport_vert_distance: Option<i64>,
+    #[serde(rename = "departureAirportCandidatesCount", default)]
+    pub departure_airport_candidates_count: Option<i64>,
+    #[serde(rename = "arrivalAirportCandidatesCount", default)]
+    pub arrival_airport_candidates_count: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TrackEnds {
     pub dep_lat: f64,
     pub dep_lon: f64,
     pub arr_lat: f64,
     pub arr_lon: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct OpenskyProbeReport {
-    pub hex: String,
-    pub date: String,
-    pub token_ok: bool,
-    pub states_status: Option<u16>,
-    pub states_remaining: Option<u32>,
-    pub flights_status: Option<u16>,
-    pub flights_remaining: Option<u32>,
-    pub flights_remaining_before: Option<u32>,
-    pub flights_credits_spent: Option<u32>,
-    pub flights_begin: Option<i64>,
-    pub flights_end: Option<i64>,
-    pub flights_window: String,
-    pub flights_count: usize,
-    pub note: String,
+    /// OpenSky track `callsign` (docs sometimes spell `calllsign`). Fill-in only.
+    #[serde(default)]
+    pub callsign: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -404,48 +404,6 @@ impl OpenskyClient {
         })
     }
 
-    pub async fn flights_aircraft(
-        &self,
-        icao24: &str,
-        date: NaiveDate,
-    ) -> Result<OpenskyOutcome<Vec<Flight>>> {
-        let (begin, end) = utc_day_window(date);
-        self.flights_aircraft_range(icao24, begin, end).await
-    }
-
-    pub async fn flights_aircraft_range(
-        &self,
-        icao24: &str,
-        begin: i64,
-        end: i64,
-    ) -> Result<OpenskyOutcome<Vec<Flight>>> {
-        let mut url = reqwest::Url::parse(&format!("{API_ROOT}/flights/aircraft"))?;
-        url.query_pairs_mut()
-            .append_pair("icao24", &icao24.to_ascii_lowercase())
-            .append_pair("begin", &begin.to_string())
-            .append_pair("end", &end.to_string());
-        let (status, headers, body) = self.authed_get(url, CreditBucket::Flights).await?;
-        let credit = credit_from_headers(&headers, CreditBucket::Flights);
-        match classify(status, body, credit)? {
-            OpenskyOutcome::Ok { data, credit } => {
-                let flights = parse_flights(&data)?;
-                Ok(OpenskyOutcome::Ok {
-                    data: flights,
-                    credit,
-                })
-            }
-            OpenskyOutcome::NotFound { credit } => Ok(OpenskyOutcome::NotFound { credit }),
-            OpenskyOutcome::RateLimited { credit } => Ok(OpenskyOutcome::RateLimited { credit }),
-            OpenskyOutcome::Denied { status, message } => {
-                Ok(OpenskyOutcome::Denied { status, message })
-            }
-            OpenskyOutcome::Other { status, message } => {
-                Ok(OpenskyOutcome::Other { status, message })
-            }
-        }
-    }
-
-    /// `GET /flights/all` for `[begin, end]` (must be ≤ 2 hours).
     pub async fn flights_all(
         &self,
         begin: i64,
@@ -637,110 +595,6 @@ impl OpenskyClient {
             }
         }
     }
-
-    pub async fn probe(
-        &self,
-        hex: &str,
-        date: NaiveDate,
-        window_hours: Option<u32>,
-        flights_remaining_before: Option<u32>,
-    ) -> Result<OpenskyProbeReport> {
-        let hex = hex.to_ascii_lowercase();
-        let (begin, end, window) = match window_hours {
-            Some(h) if h > 0 && h < 24 => {
-                let (b, e) = utc_hours_window(date, 12, h);
-                (b, e, format!("{h}h from 12:00 UTC"))
-            }
-            _ => {
-                let (b, e) = utc_day_window(date);
-                (b, e, "utc_day [00:00:00, 23:59:59]".into())
-            }
-        };
-        if let Err(e) = self.bearer().await {
-            return Ok(OpenskyProbeReport {
-                hex,
-                date: date.to_string(),
-                token_ok: false,
-                states_status: None,
-                states_remaining: None,
-                flights_status: None,
-                flights_remaining: None,
-                flights_remaining_before,
-                flights_credits_spent: None,
-                flights_begin: Some(begin),
-                flights_end: Some(end),
-                flights_window: window,
-                flights_count: 0,
-                note: format!("token failed: {e}"),
-            });
-        }
-        let mut note = String::new();
-        let skip_states = window_hours.is_some();
-        let (states_status, states_remaining) = if skip_states {
-            note.push_str("states skipped (window probe); ");
-            (None, None)
-        } else {
-            match self.states_fleet(std::slice::from_ref(&hex)).await? {
-                OpenskyOutcome::Ok { data, credit } => {
-                    note.push_str(&format!("states hexes={}; ", data.len()));
-                    (Some(200u16), credit.remaining)
-                }
-                OpenskyOutcome::NotFound { credit } => (Some(404), credit.remaining),
-                OpenskyOutcome::RateLimited { credit } => {
-                    note.push_str("states 429; ");
-                    (Some(429), credit.remaining)
-                }
-                OpenskyOutcome::Denied { status, message } => {
-                    note.push_str(&format!("states {status} {message}; "));
-                    (Some(status), None)
-                }
-                OpenskyOutcome::Other { status, message } => {
-                    note.push_str(&format!("states {status} {message}; "));
-                    (Some(status), None)
-                }
-            }
-        };
-        let (flights_status, flights_remaining, flights_count) =
-            match self.flights_aircraft_range(&hex, begin, end).await? {
-                OpenskyOutcome::Ok { data, credit } => (Some(200u16), credit.remaining, data.len()),
-                OpenskyOutcome::NotFound { credit } => {
-                    note.push_str("flights 404 (no legs that day); ");
-                    (Some(404), credit.remaining, 0)
-                }
-                OpenskyOutcome::RateLimited { credit } => (Some(429), credit.remaining, 0),
-                OpenskyOutcome::Denied { status, message } => {
-                    note.push_str(&format!("flights {status} {message}; "));
-                    (Some(status), None, 0)
-                }
-                OpenskyOutcome::Other { status, message } => {
-                    note.push_str(&format!("flights {status} {message}; "));
-                    (Some(status), None, 0)
-                }
-            };
-        let flights_credits_spent = match (flights_remaining_before, flights_remaining) {
-            (Some(before), Some(after)) if before >= after => Some(before - after),
-            _ => None,
-        };
-        if note.is_empty() {
-            note = "ok".into();
-        }
-        Ok(OpenskyProbeReport {
-            hex,
-            date: date.to_string(),
-            token_ok: true,
-            states_status,
-            states_remaining,
-            flights_status,
-            flights_remaining,
-            flights_remaining_before,
-            flights_credits_spent,
-            flights_begin: Some(begin),
-            flights_end: Some(end),
-            flights_window: window,
-            flights_count,
-            note,
-        })
-    }
 }
 
 #[derive(Deserialize)]
@@ -856,6 +710,24 @@ pub fn overlap_fleet_journal(
     }
 }
 
+fn normalize_ident(value: &mut Option<String>) {
+    if let Some(ref mut a) = value {
+        *a = a.trim().to_ascii_uppercase();
+        if a.is_empty() {
+            *value = None;
+        }
+    }
+}
+
+fn normalize_callsign(raw: Option<&str>) -> Option<String> {
+    let t = raw?.trim().to_ascii_uppercase();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 pub fn parse_flights(bytes: &[u8]) -> Result<Vec<Flight>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -865,18 +737,9 @@ pub fn parse_flights(bytes: &[u8]) -> Result<Vec<Flight>> {
         .into_iter()
         .map(|mut f| {
             f.icao24 = f.icao24.to_ascii_lowercase();
-            if let Some(ref mut a) = f.est_departure_airport {
-                *a = a.trim().to_ascii_uppercase();
-                if a.is_empty() {
-                    f.est_departure_airport = None;
-                }
-            }
-            if let Some(ref mut a) = f.est_arrival_airport {
-                *a = a.trim().to_ascii_uppercase();
-                if a.is_empty() {
-                    f.est_arrival_airport = None;
-                }
-            }
+            normalize_ident(&mut f.est_departure_airport);
+            normalize_ident(&mut f.est_arrival_airport);
+            f.callsign = normalize_callsign(f.callsign.as_deref());
             f
         })
         .collect())
@@ -923,11 +786,17 @@ pub fn parse_track_endpoints(bytes: &[u8]) -> Option<TrackEnds> {
     }
     let (dep_lat, dep_lon) = *coords.first()?;
     let (arr_lat, arr_lon) = *coords.last()?;
+    let callsign = v
+        .get("callsign")
+        .or_else(|| v.get("calllsign"))
+        .and_then(|x| x.as_str())
+        .and_then(|s| normalize_callsign(Some(s)));
     Some(TrackEnds {
         dep_lat,
         dep_lon,
         arr_lat,
         arr_lon,
+        callsign,
     })
 }
 
@@ -955,7 +824,7 @@ pub fn flight_to_trip(
     let mut arr_lat = arr_ap.map(|a| a.lat);
     let mut arr_lon = arr_ap.map(|a| a.lon);
 
-    if let Some(t) = track {
+    if let Some(t) = track.as_ref() {
         if dep_lat.is_none() {
             dep_lat = Some(t.dep_lat);
             dep_lon = Some(t.dep_lon);
@@ -986,6 +855,11 @@ pub fn flight_to_trip(
             .map(|(la, lo)| crate::airports::format_latlon(la, lo))
     });
 
+    let callsign = flight
+        .callsign
+        .clone()
+        .or_else(|| track.as_ref().and_then(|t| t.callsign.clone()));
+
     Some(TripRow {
         icao24: row.icao24.clone(),
         dep_ts,
@@ -1007,6 +881,13 @@ pub fn flight_to_trip(
         arr_place,
         source: source.as_str().to_string(),
         fetched_at: fetched_at.to_string(),
+        callsign,
+        dep_airport_horiz_m: flight.est_departure_airport_horiz_distance,
+        dep_airport_vert_m: flight.est_departure_airport_vert_distance,
+        arr_airport_horiz_m: flight.est_arrival_airport_horiz_distance,
+        arr_airport_vert_m: flight.est_arrival_airport_vert_distance,
+        dep_airport_candidates: flight.departure_airport_candidates_count,
+        arr_airport_candidates: flight.arrival_airport_candidates_count,
     })
 }
 
@@ -1139,12 +1020,22 @@ mod tests {
           "firstSeen":1705276800,
           "lastSeen":1705280400,
           "estDepartureAirport":"KAPA",
-          "estArrivalAirport":"KJFK"
+          "estArrivalAirport":"KJFK",
+          "callsign":" dcm1  ",
+          "estDepartureAirportHorizDistance": 1250,
+          "estDepartureAirportVertDistance": 304,
+          "estArrivalAirportHorizDistance": 800,
+          "estArrivalAirportVertDistance": 50,
+          "departureAirportCandidatesCount": 1,
+          "arrivalAirportCandidatesCount": 2
         }]"#;
         let f = parse_flights(json).unwrap();
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].icao24, "abcdef");
         assert_eq!(f[0].est_departure_airport.as_deref(), Some("KAPA"));
+        assert_eq!(f[0].callsign.as_deref(), Some("DCM1"));
+        assert_eq!(f[0].est_departure_airport_horiz_distance, Some(1250));
+        assert_eq!(f[0].arrival_airport_candidates_count, Some(2));
     }
 
     #[test]
@@ -1164,13 +1055,17 @@ mod tests {
 
     #[test]
     fn parse_track_first_last() {
-        let json = br#"{"path":[
-          [1,39.57,-104.67,100,90,false],
-          [2,40.64,-73.78,200,90,true]
-        ]}"#;
+        let json = br#"{
+          "calllsign":" n175ct ",
+          "path":[
+            [1,39.57,-104.67,100,90,false],
+            [2,40.64,-73.78,200,90,true]
+          ]
+        }"#;
         let t = parse_track_endpoints(json).unwrap();
         assert!((t.dep_lat - 39.57).abs() < 1e-9);
         assert!((t.arr_lat - 40.64).abs() < 1e-9);
+        assert_eq!(t.callsign.as_deref(), Some("N175CT"));
     }
 
     #[test]
@@ -1197,6 +1092,7 @@ mod tests {
             last_seen: Some(1_705_280_400),
             est_departure_airport: Some("KAPA".into()),
             est_arrival_airport: Some("KJFK".into()),
+            ..Default::default()
         };
         let trip = flight_to_trip(
             &flight,
@@ -1238,6 +1134,7 @@ mod tests {
             last_seen: Some(1_705_280_400),
             est_departure_airport: Some("KAPA".into()),
             est_arrival_airport: None,
+            ..Default::default()
         };
         let trip =
             flight_to_trip(&flight, &row, &idx, None, "t", TripSource::OpenskyFlights).unwrap();
@@ -1271,6 +1168,7 @@ mod tests {
             last_seen: None,
             est_departure_airport: None,
             est_arrival_airport: None,
+            ..Default::default()
         };
         assert!(
             flight_to_trip(&flight, &row, &idx, None, "t", TripSource::OpenskyFlights).is_none()
@@ -1300,6 +1198,7 @@ mod tests {
             last_seen: Some(1_705_280_400),
             est_departure_airport: None,
             est_arrival_airport: None,
+            ..Default::default()
         };
         let trip = flight_to_trip(
             &flight,
@@ -1310,6 +1209,7 @@ mod tests {
                 dep_lon: -104.67,
                 arr_lat: 40.64,
                 arr_lon: -73.78,
+                callsign: Some("N1".into()),
             }),
             "t",
             TripSource::OpenskyTrack,
@@ -1319,5 +1219,58 @@ mod tests {
         assert!((trip.dep_lat.unwrap() - 39.57).abs() < 1e-9);
         assert!((trip.arr_lat.unwrap() - 40.64).abs() < 1e-9);
         assert_eq!(trip.source, "opensky_track");
+        assert_eq!(trip.callsign.as_deref(), Some("N1"));
+    }
+
+    #[test]
+    fn flight_callsign_wins_over_track() {
+        let csv = "ident,type,latitude_deg,longitude_deg\nKAPA,large_airport,39.5701,-104.6737\nKJFK,large_airport,40.6399,-73.7787\n";
+        let idx = AirportIndex::from_reader(csv.as_bytes()).unwrap();
+        let row = FleetRow {
+            n_number: "N1".into(),
+            icao24: "abcdef".into(),
+            ticker: "AAA".into(),
+            cik: None,
+            company_name: None,
+            make: None,
+            model: None,
+            registrant_name: None,
+            match_method: None,
+            aviation_issuer: 0,
+            fleet_size: 1,
+            as_of_date: None,
+        };
+        let flight = Flight {
+            icao24: "abcdef".into(),
+            first_seen: 1_705_276_800,
+            last_seen: Some(1_705_280_400),
+            est_departure_airport: Some("KAPA".into()),
+            est_arrival_airport: Some("KJFK".into()),
+            callsign: Some("DCM123".into()),
+            est_departure_airport_horiz_distance: Some(100),
+            est_departure_airport_vert_distance: Some(20),
+            est_arrival_airport_horiz_distance: Some(200),
+            est_arrival_airport_vert_distance: Some(30),
+            departure_airport_candidates_count: Some(1),
+            arrival_airport_candidates_count: Some(2),
+        };
+        let trip = flight_to_trip(
+            &flight,
+            &row,
+            &idx,
+            Some(TrackEnds {
+                dep_lat: 39.57,
+                dep_lon: -104.67,
+                arr_lat: 40.64,
+                arr_lon: -73.78,
+                callsign: Some("TRACK".into()),
+            }),
+            "t",
+            TripSource::OpenskyFlights,
+        )
+        .unwrap();
+        assert_eq!(trip.callsign.as_deref(), Some("DCM123"));
+        assert_eq!(trip.dep_airport_horiz_m, Some(100));
+        assert_eq!(trip.arr_airport_candidates, Some(2));
     }
 }

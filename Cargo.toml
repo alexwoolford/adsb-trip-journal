@@ -3,7 +3,7 @@ name = "adsb-trip-journal"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Restartable trip journal for mapped corporate tails (ADS-B Exchange traces + OpenSky REST)"
+description = "Restartable trip journal for mapped corporate tails (OpenSky REST)"
 rust-version = "1.80"
 
 [lib]
