@@ -12,7 +12,7 @@ OpenSky Standard REST: **4,000 credits/day per independent bucket** (states / fl
 
 | Job | Unit | Behavior |
 |---|---|---|
-| **Watch** | `adsb-trip-journal-watch.service` | **Optional** diagnostic. Long-running `/states/all` every 10 min. icao24-filtered calls cost **4** states-credits each (not serial-only 1). Fleet is chunked by 80 hexes, so ~331 hexes = 5 calls ≈ **20** credits/poll. Record `seen_airborne` for today UTC (collect does not use this as an allow-list or resume signal). Reloads the mapping fleet each poll. Disable after nightly `/flights/all` looks healthy; keep the unit for a manual “who is up” poll. |
+| **Watch** | `adsb-trip-journal-watch.service` | **Optional** diagnostic; `install.sh` does **not** enable it. Long-running `/states/all` every 10 min. icao24-filtered calls cost **4** states-credits each (not serial-only 1). Fleet is chunked by 80 hexes, so ~331 hexes = 5 calls ≈ **20** credits/poll. Record `seen_airborne` for today UTC (collect does not use this as an allow-list or resume signal). Reloads the mapping fleet each poll. Enable by hand for a “who is up” poll. |
 | **Collect** | `adsb-trip-journal-collect.timer` | Daily **06:00 UTC** + up to 15 min jitter. Twelve `GET /flights/all` slices for yesterday UTC, then leftover flights credits walk back over never-started or incomplete days in a **90-day** repair window. Filter to the mapped fleet; persist fleet-filtered JSON. Day complete only after 12/12. Host cap `OPENSKY_MAX_FLIGHTS_CREDITS` **3600** (~10 UTC days/run, ~400 slack). CLI/laptop default **800**. `install.sh` does not overwrite an existing env file. |
 
 404 on `/flights/all` for a 2h global window is rare (empty interval). 429 does not mark remaining slices complete. Registrant is not operator. Coverage is thinner than ADS-B Exchange (no MLAT).
@@ -37,7 +37,7 @@ Units in [`deploy/systemd/`](../deploy/systemd/):
 
 | Unit | Schedule |
 |---|---|
-| `adsb-trip-journal-watch.service` | always on (`Restart=on-failure`) |
+| `adsb-trip-journal-watch.service` | installed, not enabled (`Restart=on-failure` if started by hand) |
 | `adsb-trip-journal-collect.timer` | daily 06:00 UTC (`Persistent=true`) |
 
 Config: `/opt/adsb-trip-journal/etc/adsb-trip-journal.env` (from [`deploy/adsb-trip-journal.env.example`](../deploy/adsb-trip-journal.env.example), **chmod 600**). Install does not overwrite an existing env file.
@@ -66,9 +66,10 @@ Upgrades: pull/rsync → `cargo build --release` → `sudo ./deploy/install.sh` 
 ## Verify
 
 ```bash
-systemctl status adsb-trip-journal-watch.service --no-pager
 systemctl list-timers 'adsb-trip-journal-*'
-journalctl -u adsb-trip-journal-watch.service -u adsb-trip-journal-collect.service -n 50 --no-pager
+journalctl -u adsb-trip-journal-collect.service -n 50 --no-pager
+# Watch is optional and off by default:
+# systemctl status adsb-trip-journal-watch.service --no-pager
 
 # Does not need the 600 env file (paths are baked into the wrapper).
 sudo -u adsb /opt/adsb-trip-journal/scripts/run-status.sh

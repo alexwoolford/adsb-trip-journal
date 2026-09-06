@@ -54,7 +54,8 @@ pub struct CollectOptions {
     pub opensky: Option<Arc<OpenskyClient>>,
     pub max_flights_credits: u32,
     pub tracks_fallback: bool,
-    /// When non-empty, only these hexes are fetched (must be in the fleet slice).
+    /// When non-empty, ingest only these mapped hexes. Slice cache is still the
+    /// full fleet; a `--hex` run does not mark the UTC day complete.
     pub hex_filter: Vec<String>,
 }
 
@@ -982,13 +983,15 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
                         report.hexes_stopped_on_error += 1;
                         return Ok(SliceHalt::Stop);
                     }
-                    OpenskyOutcome::Denied { status, message } => {
+                    OpenskyOutcome::Denied { status, message }
+                    | OpenskyOutcome::Other { status, message } => {
+                        let msg = format!("tracks HTTP {status}: {message}");
+                        warn!(%hex, %msg);
                         write_tracks_cache(tracks_cache_path, &tracks_cache)?;
-                        db.set_cursor_error(&hex, &format!("tracks HTTP {status}: {message}"))?;
+                        db.set_cursor_error(&hex, &msg)?;
                         report.hexes_stopped_on_error += 1;
                         return Ok(SliceHalt::Stop);
                     }
-                    _ => {}
                 }
             }
         }
@@ -1457,5 +1460,50 @@ mod tests {
             fake.flights_http.load(std::sync::atomic::Ordering::SeqCst),
             12
         );
+    }
+
+    #[tokio::test]
+    async fn collect_opensky_tracks_other_does_not_mark_slice_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let journal = dir.path().join("trips.sqlite");
+        let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let flights = crate::opensky::parse_flights(
+            br#"[{"icao24":"abcdef","firstSeen":1705276800,"lastSeen":1705280400}]"#,
+        )
+        .unwrap();
+        let mut script = std::collections::VecDeque::new();
+        script.push_back(OpenskyOutcome::Other {
+            status: 0,
+            message: "timeout".into(),
+        });
+        let mut db = JournalDb::open(&journal).unwrap();
+        let fleet = crate::fleet::FleetQuery {
+            rows: vec![fleet_row("abcdef")],
+            skipped_empty_icao24: 0,
+            snapshot_as_of: "2026-08-31".into(),
+        };
+        db.replace_fleet_snapshot(&fleet.rows, &fleet.snapshot_as_of)
+            .unwrap();
+        let fake = FakeOpensky {
+            flights_payload: flights,
+            flights_http: std::sync::atomic::AtomicU32::new(0),
+            fail_on_flights_http: None,
+            tracks: std::sync::Mutex::new(script),
+            tracks_http: std::sync::atomic::AtomicU32::new(0),
+        };
+        let opts = collect_opts(&cache, &journal, date, Vec::new(), true);
+        let r = collect_opensky_with(&fake, &opts, fleet, db, AirportIndex::empty())
+            .await
+            .unwrap();
+        assert_eq!(r.tracks_calls, 1);
+        assert_eq!(r.flights_calls, 1);
+        assert_eq!(r.hexes_stopped_on_error, 1);
+        let db = JournalDb::open(&journal).unwrap();
+        assert!(
+            !db.flights_all_slice_complete(date, 0).unwrap(),
+            "tracks Other must not mark the slice complete"
+        );
+        assert!(!db.flights_all_day_complete(date, 12).unwrap());
     }
 }

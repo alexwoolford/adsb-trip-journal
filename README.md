@@ -78,7 +78,7 @@ OpenSky Standard REST is **4,000 credits/day per independent bucket** (states / 
 
 **Observed billing (this account):** historical `GET /flights/aircraft` costs **30** flights-credits even for a same-UTC-day window. At 30/call, a busy fleet day cannot finish inside 4,000 (~133 hexes). Collect therefore uses **`GET /flights/all`** (max 2 hours, all aircraft seen in the interval), twelve slices covering yesterday, then leftover flights credits fill never-started or incomplete days in a **90-day** window. Cost is per request, not per tail. A 2h historical slice billed **30** (2026-09-03 12:00–14:00 UTC probe: HTTP 200, ~2.3MB, 2.6s) so a day is **12 × 30 = 360**. `--max-flights-credits` default **800** (laptop; two UTC days). Production host env is **3600** (~10 days/run, ~400 slack). `install.sh` does not overwrite an existing env file. Fleet-filtered slices are cached under `cache/flights_all/YYYY-MM-DD/{00-11}.json.gz` so a retry does not re-spend credits. `--hex` applies only at ingest and does not shrink that cache or mark the day complete. A UTC day is complete only after 12/12 slices; a 429 leaves the rest for the next run. Successful `/tracks` lookups are cached beside the slice so a 429 resume does not re-burn the tracks bucket.
 
-Watch still polls `/states/all` and writes `seen_airborne`. Collect is **not** gated on that list. Watch is optional (~2,880 states-credits/day); keep the unit for a manual “who is up” poll and disable it after nightly collect looks healthy.
+Watch still polls `/states/all` and writes `seen_airborne`. Collect is **not** gated on that list. Watch is optional (~2,880 states-credits/day). `install.sh` installs the unit but does **not** enable it; start it by hand for a “who is up” poll.
 
 | Call | What you get | Cost (observed / assumed) |
 |---|---|---|
@@ -114,7 +114,7 @@ sudo ADSB_AIRPORTS_CSV=/path/airports.csv \
      ./deploy/install.sh
 ```
 
-Watch is long-running (`/states/all` every 10 min, ~20 states-credits/poll for a ~331-hex fleet ≈ 2,880/day of the 4,000 states bucket). It is **optional** — collect does not read `seen_airborne`. Collect is a daily timer at **06:00 UTC** (yesterday’s 12× `/flights/all`, then leftover credits fill a **90-day** repair window; host cap **3600**, CLI **800**). Production mapping path is `/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite` (`TAIL_TO_TICKER_SQLITE`); the `adsb` user must be able to read it. Watch re-opens it every poll. Wrappers default to that path; do not fall back to `$STATE/mapping/`.
+Watch is long-running (`/states/all` every 10 min, ~20 states-credits/poll for a ~331-hex fleet ≈ 2,880/day of the 4,000 states bucket). It is **optional** and **not enabled** by `install.sh` — collect does not read `seen_airborne`. Collect is a daily timer at **06:00 UTC** (yesterday’s 12× `/flights/all`, then leftover credits fill a **90-day** repair window; host cap **3600**, CLI **800**). Production mapping path is `/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite` (`TAIL_TO_TICKER_SQLITE`); the `adsb` user must be able to read it. Watch re-opens it every poll. Wrappers default to that path; do not fall back to `$STATE/mapping/`.
 
 Out of this pass: OpenSky feeder (8k tier), analyst HTTP API, alerts/geofences.
 

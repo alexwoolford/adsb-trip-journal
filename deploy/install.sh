@@ -14,8 +14,8 @@
 # Live mapping is TAIL_TO_TICKER_SQLITE in the env file (default
 # /var/lib/tail-to-ticker/current/tail_to_ticker.sqlite). Units enable only
 # when that file exists; $STATE/mapping/ is not required.
-# Watch is optional (collect does not read seen_airborne). This script still
-# enables the watch unit; disable it after nightly /flights/all is proven.
+# Watch is optional (collect does not read seen_airborne). This script installs
+# the watch unit but does not enable it. Enable by hand for a “who is up” poll.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -120,6 +120,10 @@ fi
 
 systemctl daemon-reload
 
+# Watch is optional (collect does not read seen_airborne). Never enable it.
+# A previous install may have left it running (~2,880 states-credits/day).
+systemctl disable --now adsb-trip-journal-watch.service >/dev/null 2>&1 || true
+
 creds_set=0
 if [[ -f "$ENV_DST" ]] && grep -qE '^OPENSKY_CLIENT_SECRET=.+' "$ENV_DST"; then
   creds_set=1
@@ -156,13 +160,14 @@ if [[ ! -f "$AIRPORTS_DST" ]]; then
 fi
 
 if [[ "$creds_set" -eq 1 ]]; then
-  systemctl enable --now adsb-trip-journal-watch.service
   systemctl enable --now adsb-trip-journal-collect.timer
-  echo "  watch: adsb-trip-journal-watch.service enabled"
   echo "  timer: adsb-trip-journal-collect.timer enabled (daily 06:00 UTC + 15m jitter)"
-else
-  echo "  OPENSKY_CLIENT_SECRET is empty — units not enabled."
-  echo "  Fill credentials in $ENV_DST, then:"
+  echo "  watch: installed, not enabled (collect does not read seen_airborne)"
   echo "    sudo systemctl enable --now adsb-trip-journal-watch.service"
+else
+  echo "  OPENSKY_CLIENT_SECRET is empty — timer not enabled."
+  echo "  Fill credentials in $ENV_DST, then:"
   echo "    sudo systemctl enable --now adsb-trip-journal-collect.timer"
+  echo "  Optional diagnostic:"
+  echo "    sudo systemctl enable --now adsb-trip-journal-watch.service"
 fi

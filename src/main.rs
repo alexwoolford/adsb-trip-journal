@@ -130,6 +130,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Laptop-only: load `.env` from cwd. Production uses systemd EnvironmentFile.
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
