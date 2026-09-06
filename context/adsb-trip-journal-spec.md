@@ -58,7 +58,7 @@ Daily loop (conceptual):
 
 1. Open mapping SQLite read-only. Run the fleet query (§3). Skip rows with empty `icao24`.
 2. Upsert `fleet_snapshot` (copy of keys + ticker/cik as of this run).
-3. Cover yesterday UTC with twelve `GET /flights/all` 2-hour slices. Filter to the mapped fleet, persist the **full fleet** slice JSON, then ingest (`--hex` only restricts ingest). Resume from incomplete `flights_all_slice` rows; trip days inside a 14-day lookback; else yesterday. Watch `seen_airborne` is not a gate and does not pull `--from` backward.
+3. Cover yesterday UTC with twelve `GET /flights/all` 2-hour slices, then leftover flights credits fill never-started or incomplete days in a **90-day** repair window (oldest first). Filter to the mapped fleet, persist the **full fleet** slice JSON, then ingest (`--hex` only restricts ingest). Incomplete `flights_all_slice` rows older than the window still resume. Watch `seen_airborne` is not a gate and does not pull `--from` backward.
 4. When neither airport ident places, optionally `GET /tracks` and cache the attempt beside the slice. Missing arrival stays missing (do not copy dep lat/lon onto arr).
 5. Mark a UTC day complete only after 12/12 unfiltered ingest. Do not bulk-write per-hex `fetch_cursor` for OpenSky. Never open the mapping DB for write.
 
@@ -248,7 +248,7 @@ v1 does not reverse-geocode to city names. Place names can be joined later from 
 
 Credentials: environment only (`OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`, or `ADSBX_API_KEY`). Never commit keys. Never put them in tail-to-ticker.
 
-Credit cap: **800** flights-credits per collect run (two UTC days at 30/slice). Host env matches; install does not overwrite an existing env file.
+Credit cap: CLI/laptop **800** flights-credits per collect run (two UTC days at 30/slice). Production host env **3600** (repair budget; ~10 days/run). Install does not overwrite an existing env file. Lookback is **90** UTC days of never-started or incomplete `/flights/all` days.
 
 Rate limits: honor 429; do not mark remaining `/flights/all` slices complete. Persist slice JSON and tracks attempts so retries do not re-spend. Do not parallel-bomb the API.
 

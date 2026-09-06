@@ -13,7 +13,7 @@ OpenSky Standard REST: **4,000 credits/day per independent bucket** (states / fl
 | Job | Unit | Behavior |
 |---|---|---|
 | **Watch** | `adsb-trip-journal-watch.service` | **Optional** diagnostic. Long-running `/states/all` every 10 min. icao24-filtered calls cost **4** states-credits each (not serial-only 1). Fleet is chunked by 80 hexes, so ~331 hexes = 5 calls ≈ **20** credits/poll. Record `seen_airborne` for today UTC (collect does not use this as an allow-list or resume signal). Reloads the mapping fleet each poll. Disable after nightly `/flights/all` looks healthy; keep the unit for a manual “who is up” poll. |
-| **Collect** | `adsb-trip-journal-collect.timer` | Daily **06:00 UTC** + up to 15 min jitter. Twelve `GET /flights/all` slices for yesterday UTC, filter to the mapped fleet, persist fleet-filtered JSON. Day complete only after 12/12. Cap `--max-flights-credits` **800** (two UTC days at 30/slice). `install.sh` does not overwrite an existing env file. |
+| **Collect** | `adsb-trip-journal-collect.timer` | Daily **06:00 UTC** + up to 15 min jitter. Twelve `GET /flights/all` slices for yesterday UTC, then leftover flights credits walk back over never-started or incomplete days in a **90-day** repair window. Filter to the mapped fleet; persist fleet-filtered JSON. Day complete only after 12/12. Host cap `OPENSKY_MAX_FLIGHTS_CREDITS` **3600** (~10 UTC days/run, ~400 slack). CLI/laptop default **800**. `install.sh` does not overwrite an existing env file. |
 
 404 on `/flights/all` for a 2h global window is rare (empty interval). 429 does not mark remaining slices complete. Registrant is not operator. Coverage is thinner than ADS-B Exchange (no MLAT).
 
@@ -42,7 +42,7 @@ Units in [`deploy/systemd/`](../deploy/systemd/):
 
 Config: `/opt/adsb-trip-journal/etc/adsb-trip-journal.env` (from [`deploy/adsb-trip-journal.env.example`](../deploy/adsb-trip-journal.env.example), **chmod 600**). Install does not overwrite an existing env file.
 
-First collect after a new install covers yesterday via `/flights/all` even if `seen_airborne` is empty. A partial first UTC day of watch is unrelated to collect completeness. Watch does not pull collect `--from` backward.
+First collect after a new install covers yesterday via `/flights/all`, then walks back never-started days in the 90-day window until the host cap. A partial first UTC day of watch is unrelated to collect completeness. Watch does not pull collect `--from` backward.
 
 ## Layout
 
@@ -93,7 +93,7 @@ TAIL_TO_TICKER_SQLITE=/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite
 ## Credit budget
 
 - Watch: ~**20** states-credits/poll × 144 ≈ **2,880**/day of the 4,000 **states** bucket (icao24 filter is 4/call × 5 chunks for a ~331-hex fleet). Independent of flights. Optional; collect does not spend this.
-- Collect: **12 × `/flights/all`** per UTC day of the **flights** bucket (**30**/slice measured 2026-09-03 = **360**/day). Cap **800**. Incomplete days resume from cached fleet-filtered slices. `--hex` does not shrink the cache.
+- Collect: **12 × `/flights/all`** per UTC day of the **flights** bucket (**30**/slice measured 2026-09-03 = **360**/day). Host cap **3600** (CLI/laptop **800**). After yesterday, leftover credits fill never-started or incomplete days in a **90-day** window (oldest first). When that window is 12/12, leftover credits stay unused. `--hex` does not shrink the cache.
 - Tracks fallback only when both airport estimates are missing (tracks bucket). Successful (and empty) `/tracks` attempts are cached per slice so a 429 resume does not re-call the same `icao24+firstSeen`.
 
 ## Limits

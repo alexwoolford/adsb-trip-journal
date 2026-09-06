@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Oneshot: collect yesterday UTC via 12× GET /flights/all (filter mapped fleet).
-# Incomplete slice days resume. Not gated on seen_airborne.
+# Then leftover credits fill never-started/incomplete days in the 90-day window.
+# Wrapper default 800 (laptop). Production host env is 3600. Not gated on seen_airborne.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

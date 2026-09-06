@@ -28,8 +28,9 @@ pub const TRACKS_CALL_CREDITS: u32 = 4;
 /// Serial-only `/states/all` is 1; icao24/bbox billed **4** on this account
 /// (2026-09-02 watch: 5 chunks of 80 → remaining dropped 20/poll).
 pub const STATES_CALL_CREDITS: u32 = 4;
-/// Catch-up budget: two UTC days of `/flights/all` at 30/slice is 720.
-/// Host env matches; `install.sh` does not overwrite an existing env file.
+/// Laptop/dev collect cap: two UTC days of `/flights/all` at 30/slice is 720.
+/// Production host env is **3600** (repair budget; ~10 days/run, ~400 slack).
+/// `install.sh` does not overwrite an existing env file.
 pub const DEFAULT_MAX_FLIGHTS_CREDITS: u32 = 800;
 pub const HEX_CHUNK: usize = 80;
 /// `/flights/all` max window. Twelve adjacent slices cover one UTC day.
@@ -41,10 +42,10 @@ pub const FLIGHTS_ALL_SLICE_SECS: i64 = 7_200;
 pub const FLIGHTS_ALL_SLICE_CREDITS: u32 = 30;
 const STATES_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const FLIGHTS_ALL_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
-/// How far back default collect looks for trip days that were never covered
-/// by `/flights/all`. Watch `seen_airborne` is not used. Incomplete slice
-/// rows always resume, even older.
-pub const FLIGHTS_ALL_LOOKBACK_DAYS: u64 = 14;
+/// Rolling repair window: never-started or incomplete `/flights/all` days
+/// inside this many UTC days before yesterday. Watch `seen_airborne` is not
+/// used. Incomplete slice rows older than the window still resume.
+pub const FLIGHTS_ALL_LOOKBACK_DAYS: u64 = 90;
 
 /// How many `/states/all` requests a fleet of `n_hexes` needs at [`HEX_CHUNK`].
 pub fn states_request_count(n_hexes: usize) -> u32 {
@@ -1097,6 +1098,7 @@ mod tests {
         assert_eq!(FLIGHTS_CALL_CREDITS, 30);
         assert_eq!(FLIGHTS_ALL_SLICE_CREDITS, 30);
         assert_eq!(DEFAULT_MAX_FLIGHTS_CREDITS, 800);
+        assert_eq!(FLIGHTS_ALL_LOOKBACK_DAYS, 90);
     }
 
     #[test]

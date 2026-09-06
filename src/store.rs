@@ -513,10 +513,10 @@ impl JournalDb {
         Ok(out)
     }
 
-    /// Oldest UTC date that still needs `/flights/all` slices, else `yesterday`.
-    /// Incomplete slice rows always resume. Trip days without slices are only
-    /// considered inside `lookback_days` so collect stays bounded. Watch
-    /// `seen_airborne` does not pull the start date backward.
+    /// Oldest UTC date in the lookback window that still needs `/flights/all`
+    /// slices (never started or incomplete), else `yesterday`. Incomplete slice
+    /// rows older than the window still resume. Watch `seen_airborne` does not
+    /// pull the start date backward.
     pub fn default_opensky_collect_from(
         &self,
         yesterday: NaiveDate,
@@ -545,10 +545,7 @@ impl JournalDb {
 
         let mut d = floor;
         while d <= yesterday {
-            if d < start
-                && !self.flights_all_day_complete(d, n_slices)?
-                && (d == yesterday || self.has_trips_on(d)?)
-            {
+            if d < start && !self.flights_all_day_complete(d, n_slices)? {
                 start = d;
             }
             d = match d.succ_opt() {
@@ -877,17 +874,69 @@ mod tests {
         assert_eq!(db.flights_all_slices_done(d).unwrap(), 2);
         assert!(!db.flights_all_day_complete(d, 12).unwrap());
         let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(start, d, "incomplete slices resume even when not yesterday");
+        let floor = yesterday.checked_sub_days(chrono::Days::new(14)).unwrap();
+        assert_eq!(
+            start, floor,
+            "never-started days in lookback resume from the floor; incomplete Sep 3 is not older"
+        );
         for i in 2..12 {
             db.mark_flights_all_slice_ok(d, i).unwrap();
         }
         assert!(db.flights_all_day_complete(d, 12).unwrap());
         let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
+        assert_eq!(
+            start, floor,
+            "complete Sep 3 does not skip empty lookback days behind it"
+        );
+    }
+
+    #[test]
+    fn default_from_empty_window_starts_at_lookback_floor() {
+        let dir = tempdir().unwrap();
+        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
+        assert_eq!(
+            start,
+            yesterday.checked_sub_days(chrono::Days::new(14)).unwrap()
+        );
+        let start90 = db.default_opensky_collect_from(yesterday, 12, 90).unwrap();
+        assert_eq!(
+            start90,
+            yesterday.checked_sub_days(chrono::Days::new(90)).unwrap()
+        );
+    }
+
+    #[test]
+    fn default_from_resumes_incomplete_slices_older_than_lookback() {
+        let dir = tempdir().unwrap();
+        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let old = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        db.mark_flights_all_slice_ok(old, 0).unwrap();
+        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
+        assert_eq!(start, old);
+    }
+
+    #[test]
+    fn default_from_yesterday_only_when_lookback_complete() {
+        let dir = tempdir().unwrap();
+        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let floor = yesterday.checked_sub_days(chrono::Days::new(14)).unwrap();
+        let mut d = floor;
+        while d <= yesterday {
+            for i in 0..12 {
+                db.mark_flights_all_slice_ok(d, i).unwrap();
+            }
+            d = d.succ_opt().unwrap();
+        }
+        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
         assert_eq!(start, yesterday);
     }
 
     #[test]
-    fn default_from_uses_trip_days_inside_lookback() {
+    fn default_from_uses_never_started_days_inside_lookback() {
         let dir = tempdir().unwrap();
         let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
@@ -912,7 +961,11 @@ mod tests {
         })
         .unwrap();
         let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(start, d);
+        assert_eq!(
+            start,
+            yesterday.checked_sub_days(chrono::Days::new(14)).unwrap(),
+            "trips are not required; never-started days pull to the lookback floor"
+        );
         for i in 0..11 {
             db.mark_flights_all_slice_ok(d, i).unwrap();
         }
@@ -927,11 +980,16 @@ mod tests {
         let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
         let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let empty = JournalDb::open(&dir.path().join("empty.sqlite")).unwrap();
+        let without = empty
+            .default_opensky_collect_from(yesterday, 12, 14)
+            .unwrap();
         db.mark_seen_airborne("abcdef", d).unwrap();
-        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
+        let with = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
+        assert_eq!(with, without);
         assert_eq!(
-            start, yesterday,
-            "watch seen_airborne must not pull collect start backward"
+            with,
+            yesterday.checked_sub_days(chrono::Days::new(14)).unwrap()
         );
     }
 
