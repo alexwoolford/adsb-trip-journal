@@ -61,12 +61,35 @@ fn mapping_has_deleted_at(conn: &Connection) -> bool {
         .unwrap_or(false)
 }
 
+/// Open the mapping feed without creating `-wal`/`-shm` in its directory.
+///
+/// The producer’s `current/` dir is not writable by `adsb`. A plain
+/// `SQLITE_OPEN_READ_ONLY` open of a WAL database still tries to create those
+/// sidecars (`SQLITE_READONLY_DIRECTORY`). `immutable=1` reads the main file only.
 pub fn open_mapping_ro(path: &Path) -> Result<Connection> {
+    let uri = mapping_ro_uri(path);
     Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open mapping sqlite read-only: {}", path.display()))
+}
+
+fn mapping_ro_uri(path: &Path) -> String {
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut uri = String::from("file:");
+    for b in abs.to_string_lossy().as_bytes() {
+        match *b {
+            b'%' => uri.push_str("%25"),
+            b'?' => uri.push_str("%3F"),
+            b'#' => uri.push_str("%23"),
+            c => uri.push(c as char),
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
 }
 
 pub fn query_fleet(conn: &Connection) -> Result<FleetQuery> {
@@ -199,5 +222,53 @@ mod tests {
         assert_eq!(q.rows[0].n_number, "N1");
         assert_eq!(q.rows[0].icao24, "abcdef");
         assert_eq!(q.snapshot_as_of, "2026-08-31");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_mapping_ro_does_not_need_wal_dir_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mapping = dir.path().join("map.sqlite");
+        {
+            let conn = Connection::open(&mapping).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE mappings_current (
+                  n_number TEXT PRIMARY KEY,
+                  icao24 TEXT,
+                  ticker TEXT NOT NULL,
+                  cik TEXT,
+                  company_name TEXT,
+                  make TEXT,
+                  model TEXT,
+                  registrant_name TEXT,
+                  match_method TEXT,
+                  as_of_date TEXT,
+                  fleet_size INTEGER NOT NULL,
+                  aviation_issuer INTEGER NOT NULL,
+                  deleted_at INTEGER
+                );
+                INSERT INTO mappings_current VALUES
+                  ('N1','ABCDEF','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0,NULL);
+                "#,
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let _ = std::fs::remove_file(dir.path().join("map.sqlite-wal"));
+        let _ = std::fs::remove_file(dir.path().join("map.sqlite-shm"));
+        let restore = dir.path().to_path_buf();
+        std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = (|| {
+            let conn = open_mapping_ro(&mapping)?;
+            query_fleet(&conn)
+        })();
+        std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let q = result.unwrap();
+        assert_eq!(q.rows.len(), 1);
+        assert_eq!(q.rows[0].icao24, "abcdef");
     }
 }
