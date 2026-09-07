@@ -604,10 +604,7 @@ const JOURNAL_DDL: &str = r#"
 
 const DB_NAME: &str = "adsb-trip-journal";
 
-fn install_capture(
-    conn: &Connection,
-    path: &Path,
-) -> Result<crate::capture::Nudge> {
+fn install_capture(conn: &Connection, path: &Path) -> Result<crate::capture::Nudge> {
     let tables = [
         crate::capture::TableSpec::new("trips", crate::capture::CaptureMode::Full),
         crate::capture::TableSpec::new("seen_airborne", crate::capture::CaptureMode::After),
@@ -917,10 +914,7 @@ mod tests {
             .collect();
         assert_eq!(
             trips,
-            vec![
-                ("trips".into(), "I".into()),
-                ("trips".into(), "U".into())
-            ]
+            vec![("trips".into(), "I".into()), ("trips".into(), "U".into())]
         );
     }
 
