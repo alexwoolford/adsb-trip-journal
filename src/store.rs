@@ -1,7 +1,6 @@
 //! Sibling SQLite: `fleet_snapshot`, `trips`, `flights_all_*`, leftover `fetch_cursor`.
 
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -74,6 +73,7 @@ pub struct JournalStatus {
 
 pub struct JournalDb {
     conn: Connection,
+    nudge: crate::capture::Nudge,
 }
 
 impl JournalDb {
@@ -86,77 +86,8 @@ impl JournalDb {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("open journal sqlite {}", path.display()))?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS fleet_snapshot (
-              icao24 TEXT PRIMARY KEY,
-              n_number TEXT NOT NULL,
-              ticker TEXT NOT NULL,
-              cik TEXT,
-              company_name TEXT,
-              make TEXT,
-              model TEXT,
-              aviation_issuer INTEGER NOT NULL,
-              fleet_size INTEGER NOT NULL,
-              snapshot_as_of TEXT NOT NULL,
-              recorded_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS trips (
-              icao24 TEXT NOT NULL,
-              dep_ts TEXT NOT NULL,
-              arr_ts TEXT,
-              n_number TEXT NOT NULL,
-              ticker TEXT NOT NULL,
-              cik TEXT,
-              dep_lat REAL,
-              dep_lon REAL,
-              arr_lat REAL,
-              arr_lon REAL,
-              dep_airport TEXT,
-              arr_airport TEXT,
-              dep_place TEXT,
-              arr_place TEXT,
-              source TEXT NOT NULL,
-              fetched_at TEXT NOT NULL,
-              callsign TEXT,
-              dep_airport_horiz_m INTEGER,
-              dep_airport_vert_m INTEGER,
-              arr_airport_horiz_m INTEGER,
-              arr_airport_vert_m INTEGER,
-              dep_airport_candidates INTEGER,
-              arr_airport_candidates INTEGER,
-              PRIMARY KEY (icao24, dep_ts)
-            );
-            CREATE INDEX IF NOT EXISTS idx_trips_ticker_dep ON trips (ticker, dep_ts);
-            CREATE INDEX IF NOT EXISTS idx_trips_n_number ON trips (n_number);
-            CREATE TABLE IF NOT EXISTS fetch_cursor (
-              icao24 TEXT PRIMARY KEY,
-              last_ok_date TEXT,
-              last_error TEXT,
-              updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS seen_airborne (
-              icao24 TEXT NOT NULL,
-              utc_date TEXT NOT NULL,
-              first_seen_at TEXT NOT NULL,
-              PRIMARY KEY (icao24, utc_date)
-            );
-            CREATE TABLE IF NOT EXISTS flights_all_slice (
-              utc_date TEXT NOT NULL,
-              slice_idx INTEGER NOT NULL,
-              completed_at TEXT NOT NULL,
-              PRIMARY KEY (utc_date, slice_idx)
-            );
-            CREATE TABLE IF NOT EXISTS flights_all_day (
-              utc_date TEXT PRIMARY KEY,
-              last_error TEXT,
-              updated_at TEXT NOT NULL
-            );
-            "#,
-        )?;
+        crate::capture::apply_runtime_pragmas(&conn)?;
+        conn.execute_batch(JOURNAL_DDL)?;
         ensure_column(&conn, "trips", "callsign", "TEXT")?;
         ensure_column(&conn, "trips", "dep_airport_horiz_m", "INTEGER")?;
         ensure_column(&conn, "trips", "dep_airport_vert_m", "INTEGER")?;
@@ -164,7 +95,10 @@ impl JournalDb {
         ensure_column(&conn, "trips", "arr_airport_vert_m", "INTEGER")?;
         ensure_column(&conn, "trips", "dep_airport_candidates", "INTEGER")?;
         ensure_column(&conn, "trips", "arr_airport_candidates", "INTEGER")?;
-        Ok(Self { conn })
+        migrate_strict(&conn)?;
+        conn.execute_batch(JOURNAL_DDL)?;
+        let nudge = install_capture(&conn, path)?;
+        Ok(Self { conn, nudge })
     }
 
     pub fn replace_fleet_snapshot(
@@ -207,7 +141,7 @@ impl JournalDb {
     pub fn upsert_trip(&self, row: &TripRow) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT OR REPLACE INTO trips (
+            INSERT INTO trips (
               icao24, dep_ts, arr_ts, n_number, ticker, cik,
               dep_lat, dep_lon, arr_lat, arr_lon,
               dep_airport, arr_airport, dep_place, arr_place,
@@ -220,6 +154,28 @@ impl JournalDb {
               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
               ?17, ?18, ?19, ?20, ?21, ?22, ?23
             )
+            ON CONFLICT(icao24, dep_ts) DO UPDATE SET
+              arr_ts = excluded.arr_ts,
+              n_number = excluded.n_number,
+              ticker = excluded.ticker,
+              cik = excluded.cik,
+              dep_lat = excluded.dep_lat,
+              dep_lon = excluded.dep_lon,
+              arr_lat = excluded.arr_lat,
+              arr_lon = excluded.arr_lon,
+              dep_airport = excluded.dep_airport,
+              arr_airport = excluded.arr_airport,
+              dep_place = excluded.dep_place,
+              arr_place = excluded.arr_place,
+              source = excluded.source,
+              fetched_at = excluded.fetched_at,
+              callsign = excluded.callsign,
+              dep_airport_horiz_m = excluded.dep_airport_horiz_m,
+              dep_airport_vert_m = excluded.dep_airport_vert_m,
+              arr_airport_horiz_m = excluded.arr_airport_horiz_m,
+              arr_airport_vert_m = excluded.arr_airport_vert_m,
+              dep_airport_candidates = excluded.dep_airport_candidates,
+              arr_airport_candidates = excluded.arr_airport_candidates
             "#,
             params![
                 row.icao24,
@@ -247,6 +203,7 @@ impl JournalDb {
                 row.arr_airport_candidates,
             ],
         )?;
+        self.nudge.send();
         Ok(())
     }
 
@@ -354,6 +311,7 @@ impl JournalDb {
             "#,
             params![hex, date.to_string(), now],
         )?;
+        self.nudge.send();
         Ok(())
     }
 
@@ -409,6 +367,7 @@ impl JournalDb {
             "#,
             params![date.to_string(), now],
         )?;
+        self.nudge.send();
         Ok(())
     }
 
@@ -424,6 +383,7 @@ impl JournalDb {
             "#,
             params![date.to_string(), err, now],
         )?;
+        self.nudge.send();
         Ok(())
     }
 
@@ -573,6 +533,189 @@ impl JournalDb {
             flights_all_errors,
         })
     }
+}
+
+const JOURNAL_DDL: &str = r#"
+            CREATE TABLE IF NOT EXISTS fleet_snapshot (
+              icao24 TEXT PRIMARY KEY,
+              n_number TEXT NOT NULL,
+              ticker TEXT NOT NULL,
+              cik TEXT,
+              company_name TEXT,
+              make TEXT,
+              model TEXT,
+              aviation_issuer INTEGER NOT NULL,
+              fleet_size INTEGER NOT NULL,
+              snapshot_as_of TEXT NOT NULL,
+              recorded_at TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS trips (
+              icao24 TEXT NOT NULL,
+              dep_ts TEXT NOT NULL,
+              arr_ts TEXT,
+              n_number TEXT NOT NULL,
+              ticker TEXT NOT NULL,
+              cik TEXT,
+              dep_lat REAL,
+              dep_lon REAL,
+              arr_lat REAL,
+              arr_lon REAL,
+              dep_airport TEXT,
+              arr_airport TEXT,
+              dep_place TEXT,
+              arr_place TEXT,
+              source TEXT NOT NULL,
+              fetched_at TEXT NOT NULL,
+              callsign TEXT,
+              dep_airport_horiz_m INTEGER,
+              dep_airport_vert_m INTEGER,
+              arr_airport_horiz_m INTEGER,
+              arr_airport_vert_m INTEGER,
+              dep_airport_candidates INTEGER,
+              arr_airport_candidates INTEGER,
+              PRIMARY KEY (icao24, dep_ts)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS idx_trips_ticker_dep ON trips (ticker, dep_ts);
+            CREATE INDEX IF NOT EXISTS idx_trips_n_number ON trips (n_number);
+            CREATE TABLE IF NOT EXISTS fetch_cursor (
+              icao24 TEXT PRIMARY KEY,
+              last_ok_date TEXT,
+              last_error TEXT,
+              updated_at TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS seen_airborne (
+              icao24 TEXT NOT NULL,
+              utc_date TEXT NOT NULL,
+              first_seen_at TEXT NOT NULL,
+              PRIMARY KEY (icao24, utc_date)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS flights_all_slice (
+              utc_date TEXT NOT NULL,
+              slice_idx INTEGER NOT NULL,
+              completed_at TEXT NOT NULL,
+              PRIMARY KEY (utc_date, slice_idx)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS flights_all_day (
+              utc_date TEXT PRIMARY KEY,
+              last_error TEXT,
+              updated_at TEXT NOT NULL
+            ) STRICT;
+            "#;
+
+const DB_NAME: &str = "adsb-trip-journal";
+
+fn install_capture(
+    conn: &Connection,
+    path: &Path,
+) -> Result<crate::capture::Nudge> {
+    let tables = [
+        crate::capture::TableSpec::new("trips", crate::capture::CaptureMode::Full),
+        crate::capture::TableSpec::new("seen_airborne", crate::capture::CaptureMode::After),
+        crate::capture::TableSpec::new("flights_all_slice", crate::capture::CaptureMode::After),
+        crate::capture::TableSpec::new("flights_all_day", crate::capture::CaptureMode::After),
+    ];
+    crate::capture::install(
+        conn,
+        &crate::capture::CaptureConfig::new(DB_NAME, path, &tables),
+    )
+}
+
+fn migrate_strict(conn: &Connection) -> Result<()> {
+    if crate::capture::table_is_strict(conn, "trips")? {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE fleet_snapshot_strict (
+          icao24 TEXT PRIMARY KEY,
+          n_number TEXT NOT NULL,
+          ticker TEXT NOT NULL,
+          cik TEXT,
+          company_name TEXT,
+          make TEXT,
+          model TEXT,
+          aviation_issuer INTEGER NOT NULL,
+          fleet_size INTEGER NOT NULL,
+          snapshot_as_of TEXT NOT NULL,
+          recorded_at TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO fleet_snapshot_strict SELECT * FROM fleet_snapshot;
+        DROP TABLE fleet_snapshot;
+        ALTER TABLE fleet_snapshot_strict RENAME TO fleet_snapshot;
+
+        CREATE TABLE trips_strict (
+          icao24 TEXT NOT NULL,
+          dep_ts TEXT NOT NULL,
+          arr_ts TEXT,
+          n_number TEXT NOT NULL,
+          ticker TEXT NOT NULL,
+          cik TEXT,
+          dep_lat REAL,
+          dep_lon REAL,
+          arr_lat REAL,
+          arr_lon REAL,
+          dep_airport TEXT,
+          arr_airport TEXT,
+          dep_place TEXT,
+          arr_place TEXT,
+          source TEXT NOT NULL,
+          fetched_at TEXT NOT NULL,
+          callsign TEXT,
+          dep_airport_horiz_m INTEGER,
+          dep_airport_vert_m INTEGER,
+          arr_airport_horiz_m INTEGER,
+          arr_airport_vert_m INTEGER,
+          dep_airport_candidates INTEGER,
+          arr_airport_candidates INTEGER,
+          PRIMARY KEY (icao24, dep_ts)
+        ) STRICT;
+        INSERT INTO trips_strict SELECT * FROM trips;
+        DROP TABLE trips;
+        ALTER TABLE trips_strict RENAME TO trips;
+
+        CREATE TABLE fetch_cursor_strict (
+          icao24 TEXT PRIMARY KEY,
+          last_ok_date TEXT,
+          last_error TEXT,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO fetch_cursor_strict SELECT * FROM fetch_cursor;
+        DROP TABLE fetch_cursor;
+        ALTER TABLE fetch_cursor_strict RENAME TO fetch_cursor;
+
+        CREATE TABLE seen_airborne_strict (
+          icao24 TEXT NOT NULL,
+          utc_date TEXT NOT NULL,
+          first_seen_at TEXT NOT NULL,
+          PRIMARY KEY (icao24, utc_date)
+        ) STRICT;
+        INSERT INTO seen_airborne_strict SELECT * FROM seen_airborne;
+        DROP TABLE seen_airborne;
+        ALTER TABLE seen_airborne_strict RENAME TO seen_airborne;
+
+        CREATE TABLE flights_all_slice_strict (
+          utc_date TEXT NOT NULL,
+          slice_idx INTEGER NOT NULL,
+          completed_at TEXT NOT NULL,
+          PRIMARY KEY (utc_date, slice_idx)
+        ) STRICT;
+        INSERT INTO flights_all_slice_strict SELECT * FROM flights_all_slice;
+        DROP TABLE flights_all_slice;
+        ALTER TABLE flights_all_slice_strict RENAME TO flights_all_slice;
+
+        CREATE TABLE flights_all_day_strict (
+          utc_date TEXT PRIMARY KEY,
+          last_error TEXT,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO flights_all_day_strict SELECT * FROM flights_all_day;
+        DROP TABLE flights_all_day;
+        ALTER TABLE flights_all_day_strict RENAME TO flights_all_day;
+        "#,
+    )?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
 }
 
 fn trip_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TripRow> {
@@ -768,6 +911,45 @@ mod tests {
         db.upsert_trip(&t).unwrap();
         db.upsert_trip(&t).unwrap();
         assert_eq!(db.trip_count().unwrap(), 1);
+        let trips: Vec<(String, String)> = outbox_ops(&db)
+            .into_iter()
+            .filter(|(tbl, _)| tbl == "trips")
+            .collect();
+        assert_eq!(
+            trips,
+            vec![
+                ("trips".into(), "I".into()),
+                ("trips".into(), "U".into())
+            ]
+        );
+    }
+
+    fn outbox_ops(db: &JournalDb) -> Vec<(String, String)> {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT tbl, op FROM _outbox ORDER BY seq")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn fleet_snapshot_replace_writes_no_outbox_rows() {
+        let dir = tempdir().unwrap();
+        let mut db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
+        db.replace_fleet_snapshot(&[row()], "2026-08-31").unwrap();
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM _outbox WHERE tbl = 'fleet_snapshot'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(outbox_ops(&db).is_empty());
     }
 
     #[test]

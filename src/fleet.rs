@@ -39,7 +39,27 @@ SELECT n_number, icao24, ticker, cik, company_name, make, model,
 FROM mappings_current
 WHERE aviation_issuer = 0
   AND fleet_size BETWEEN 1 AND 6
+  AND deleted_at IS NULL
 "#;
+
+const FLEET_SQL_LEGACY: &str = r#"
+SELECT n_number, icao24, ticker, cik, company_name, make, model,
+       registrant_name, match_method, aviation_issuer, fleet_size,
+       as_of_date
+FROM mappings_current
+WHERE aviation_issuer = 0
+  AND fleet_size BETWEEN 1 AND 6
+"#;
+
+fn mapping_has_deleted_at(conn: &Connection) -> bool {
+    let mut stmt = match conn.prepare("PRAGMA table_info(mappings_current)") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    stmt.query_map([], |row| row.get::<_, String>(1))
+        .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == "deleted_at"))
+        .unwrap_or(false)
+}
 
 pub fn open_mapping_ro(path: &Path) -> Result<Connection> {
     Connection::open_with_flags(
@@ -50,7 +70,12 @@ pub fn open_mapping_ro(path: &Path) -> Result<Connection> {
 }
 
 pub fn query_fleet(conn: &Connection) -> Result<FleetQuery> {
-    let mut stmt = conn.prepare(FLEET_SQL)?;
+    let sql = if mapping_has_deleted_at(conn) {
+        FLEET_SQL
+    } else {
+        FLEET_SQL_LEGACY
+    };
+    let mut stmt = conn.prepare(sql)?;
     let iter = stmt.query_map([], |row| {
         Ok(RawRow {
             n_number: row.get(0)?,
@@ -150,14 +175,16 @@ mod tests {
               match_method TEXT,
               as_of_date TEXT,
               fleet_size INTEGER NOT NULL,
-              aviation_issuer INTEGER NOT NULL
+              aviation_issuer INTEGER NOT NULL,
+              deleted_at INTEGER
             );
             INSERT INTO mappings_current VALUES
-              ('N1','ABCDEF','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0),
-              ('N2','','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0),
-              ('N3',NULL,'AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',2,0),
-              ('N4','aabbcc','BIG',NULL,'Big Co',NULL,NULL,NULL,NULL,'2026-08-31',20,0),
-              ('N5','ddeeff','OEM',NULL,'Oem Co',NULL,NULL,NULL,NULL,'2026-08-31',1,1);
+              ('N1','ABCDEF','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0,NULL),
+              ('N2','','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0,NULL),
+              ('N3',NULL,'AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',2,0,NULL),
+              ('N4','aabbcc','BIG',NULL,'Big Co',NULL,NULL,NULL,NULL,'2026-08-31',20,0,NULL),
+              ('N5','ddeeff','OEM',NULL,'Oem Co',NULL,NULL,NULL,NULL,'2026-08-31',1,1,NULL),
+              ('N6','112233','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0,1710000000);
             "#,
         )
         .unwrap();

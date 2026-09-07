@@ -30,14 +30,15 @@ fn mapping_sql() -> &'static str {
       match_method TEXT,
       as_of_date TEXT,
       fleet_size INTEGER NOT NULL,
-      aviation_issuer INTEGER NOT NULL
+      aviation_issuer INTEGER NOT NULL,
+      deleted_at INTEGER
     );
     INSERT INTO mappings_current VALUES
-      ('N1','ABCDEF','AAA','0001','A Co','GULFSTREAM','GVI',NULL,'exact_legal_name','2026-08-31',1,0),
-      ('N2','','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0),
-      ('N3',NULL,'AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',2,0),
-      ('N4','aabbcc','BIG',NULL,'Big Co',NULL,NULL,NULL,NULL,'2026-08-31',20,0),
-      ('N5','ddeeff','OEM',NULL,'Oem Co',NULL,NULL,NULL,NULL,'2026-08-31',1,1);
+      ('N1','ABCDEF','AAA','0001','A Co','GULFSTREAM','GVI',NULL,'exact_legal_name','2026-08-31',1,0,NULL),
+      ('N2','','AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',1,0,NULL),
+      ('N3',NULL,'AAA',NULL,'A Co',NULL,NULL,NULL,NULL,'2026-08-31',2,0,NULL),
+      ('N4','aabbcc','BIG',NULL,'Big Co',NULL,NULL,NULL,NULL,'2026-08-31',20,0,NULL),
+      ('N5','ddeeff','OEM',NULL,'Oem Co',NULL,NULL,NULL,NULL,'2026-08-31',1,1,NULL);
     "#
 }
 

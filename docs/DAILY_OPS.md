@@ -103,3 +103,23 @@ TAIL_TO_TICKER_SQLITE=/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite
 - Collect is not gated on `seen_airborne`
 - OpenSky resume is `flights_all` 12/12, not per-hex `fetch_cursor`
 - 401/403 on `/states/all` exits non-zero so systemd restarts the watch unit
+
+## State capture (prep)
+
+Logical name: `adsb-trip-journal`. Watch the writable journal, not a copy.
+
+| Path | Role |
+|---|---|
+| `/var/lib/adsb-trip-journal/trips.sqlite` | Watched. `_outbox` + triggers. |
+| `/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite` | Mapping input (read-only). Not this utility’s state. |
+
+Capture set: `trips` (full), `seen_airborne` / `flights_all_slice` / `flights_all_day` (after). `fleet_snapshot` is DELETE+reload and is **not** captured. `fetch_cursor` is leftover and is **not** captured.
+
+Env (optional until the collector exists; missing socket is ignored):
+
+```
+STATE_CAPTURE_SOCK=/run/state/collect.sock
+STATE_CAPTURE_ANNOUNCE_DIR=/var/lib/state-capture/announce
+```
+
+If the announce dir cannot be created, `open()` writes `{sqlite_dir}/.capturable.json`.
