@@ -16,7 +16,7 @@
 /ops/
 
 # Internal host handoff (SSH aliases, co-tenant services, sudo). Keep local; do not publish.
-/context/tail-to-ticker-host-deploy-spec.md
+/context/
 
 # Secrets / local env
 .env

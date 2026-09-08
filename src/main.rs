@@ -17,7 +17,6 @@ use adsb_trip_journal::fleet::{self, query_fleet};
 use adsb_trip_journal::opensky::{OpenskyClient, OpenskyConfig, DEFAULT_MAX_FLIGHTS_CREDITS};
 use adsb_trip_journal::store::JournalDb;
 
-const DEFAULT_MAPPING: &str = "../tail-to-ticker/data/current/tail_to_ticker.sqlite";
 const OUR_AIRPORTS_URL: &str = "https://davidmegginson.github.io/ourairports-data/airports.csv";
 
 #[derive(Parser)]
@@ -35,13 +34,8 @@ struct Cli {
         env = "TRIP_JOURNAL_CACHE"
     )]
     cache_dir: PathBuf,
-    #[arg(
-        long,
-        global = true,
-        default_value = DEFAULT_MAPPING,
-        env = "TAIL_TO_TICKER_SQLITE"
-    )]
-    mapping_sqlite: PathBuf,
+    #[arg(long, global = true, env = "TAIL_TO_TICKER_SQLITE")]
+    mapping_sqlite: Option<PathBuf>,
     #[arg(long, global = true, env = "TRIP_JOURNAL_SQLITE")]
     journal_sqlite: Option<PathBuf>,
     #[command(subcommand)]
@@ -151,7 +145,7 @@ async fn main() -> Result<()> {
             cmd_watch(&cli, &journal, *interval_secs, *max_polls).await?;
         }
         Commands::Status => {
-            cmd_status(&cli.mapping_sqlite, &journal)?;
+            cmd_status(cli.mapping_sqlite.as_deref(), &journal)?;
         }
     }
     Ok(())
@@ -181,7 +175,7 @@ async fn cmd_collect(
         )
     })?;
     let opts = CollectOptions {
-        mapping_sqlite: cli.mapping_sqlite.clone(),
+        mapping_sqlite: require_mapping(cli)?,
         journal_sqlite: journal.to_path_buf(),
         cache_dir: cli.cache_dir.clone(),
         airports_csv: Some(cli.cache_dir.join("airports.csv")),
@@ -209,8 +203,9 @@ async fn cmd_watch(
         )
     })?;
     let client = Arc::new(OpenskyClient::new(cfg)?);
+    let mapping = require_mapping(cli)?;
     let report = watch_opensky(
-        &cli.mapping_sqlite,
+        &mapping,
         journal,
         client,
         Duration::from_secs(interval_secs),
@@ -235,16 +230,17 @@ async fn cmd_probe_flights_all(cli: &Cli, date: Option<&str>) -> Result<()> {
             .unwrap_or_else(default_today_utc),
     };
     let (begin, end) = adsb_trip_journal::opensky::utc_hours_window(date, 12, 2);
-    let fleet: HashSet<String> = if cli.mapping_sqlite.exists() {
-        let conn = fleet::open_mapping_ro(&cli.mapping_sqlite)?;
-        query_fleet(&conn)?
-            .rows
-            .into_iter()
-            .map(|r| r.icao24)
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    let fleet: HashSet<String> =
+        if let Some(mapping) = cli.mapping_sqlite.as_ref().filter(|p| p.exists()) {
+            let conn = fleet::open_mapping_ro(mapping)?;
+            query_fleet(&conn)?
+                .rows
+                .into_iter()
+                .map(|r| r.icao24)
+                .collect()
+        } else {
+            HashSet::new()
+        };
     let journal = cli
         .journal_sqlite
         .clone()
@@ -327,14 +323,20 @@ async fn cmd_airports_fetch(cache_dir: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(mapping: &Path, journal: &Path) -> Result<()> {
+fn require_mapping(cli: &Cli) -> Result<PathBuf> {
+    cli.mapping_sqlite
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--mapping-sqlite or TAIL_TO_TICKER_SQLITE is required"))
+}
+
+fn cmd_status(mapping: Option<&Path>, journal: &Path) -> Result<()> {
     if !journal.exists() {
         println!("no journal at {}", journal.display());
         return Ok(());
     }
     let db = JournalDb::open(journal)?;
     let status = db.status(journal)?;
-    let fleet = if mapping.exists() {
+    let fleet = if let Some(mapping) = mapping.filter(|p| p.exists()) {
         let conn = fleet::open_mapping_ro(mapping)?;
         Some(query_fleet(&conn)?)
     } else {
