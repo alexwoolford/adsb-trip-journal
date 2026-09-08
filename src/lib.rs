@@ -1,7 +1,6 @@
 //! ADS-B trip journal: consume a tail-to-ticker mapping feed and collect trips.
 
 pub mod airports;
-mod capture;
 pub mod collect;
 pub mod fleet;
 pub mod opensky;

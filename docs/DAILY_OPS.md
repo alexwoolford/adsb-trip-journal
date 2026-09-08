@@ -8,6 +8,14 @@ Join key is lowercase **`icao24`**. Default fleet: `aviation_issuer = 0 AND flee
 
 OpenSky Standard REST: **4,000 credits/day per independent bucket** (states / flights / tracks). Historical `GET /flights/aircraft` costs **30** per hex-day and cannot cover a busy fleet. Production collect uses **12× `GET /flights/all`** (2h slices) and keeps mapped hexes. Watch is not a collect gate.
 
+## Scheduler and telemetry
+
+Collect is `adsb-trip-journal-collect.timer` + `Type=oneshot`. Watch (optional) is `Type=simple`. **The OS is the scheduler.** Do not add an in-process cron for collect.
+
+Operator logs: `tracing` on stderr → journald (`SyslogIdentifier` matches the unit). Default `RUST_LOG=info`.
+
+`flights_all_day` / `flights_all_slice` (and collect reports) are capturable domain telemetry, including credit spend. Query them in mosaic.
+
 ## Cadence
 
 | Job | Unit | Behavior |
@@ -115,7 +123,9 @@ Logical name: `adsb-trip-journal`. Watch the writable journal, not a copy.
 
 Capture set: `trips` (full), `seen_airborne` / `flights_all_slice` / `flights_all_day` (after). `fleet_snapshot` is DELETE+reload and is **not** captured. `fetch_cursor` is leftover and is **not** captured.
 
-Env (optional until the collector exists; missing socket is ignored):
+Outbox/triggers come from [`capturable-state`](https://github.com/alexwoolford/capturable-state) `v0.1.0`, not a copied `capture.rs`.
+
+Env (collector is `state-capture` on this host; missing socket is ignored):
 
 ```
 STATE_CAPTURE_SOCK=/run/state/collect.sock

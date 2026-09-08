@@ -3,6 +3,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use capturable_state::{
+    apply_runtime_pragmas, install, table_is_strict, CaptureConfig, CaptureMode, Nudge, TableSpec,
+};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -73,7 +76,7 @@ pub struct JournalStatus {
 
 pub struct JournalDb {
     conn: Connection,
-    nudge: crate::capture::Nudge,
+    nudge: Nudge,
 }
 
 impl JournalDb {
@@ -86,7 +89,7 @@ impl JournalDb {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("open journal sqlite {}", path.display()))?;
-        crate::capture::apply_runtime_pragmas(&conn)?;
+        apply_runtime_pragmas(&conn)?;
         conn.execute_batch(JOURNAL_DDL)?;
         ensure_column(&conn, "trips", "callsign", "TEXT")?;
         ensure_column(&conn, "trips", "dep_airport_horiz_m", "INTEGER")?;
@@ -604,21 +607,18 @@ const JOURNAL_DDL: &str = r#"
 
 const DB_NAME: &str = "adsb-trip-journal";
 
-fn install_capture(conn: &Connection, path: &Path) -> Result<crate::capture::Nudge> {
+fn install_capture(conn: &Connection, path: &Path) -> Result<Nudge> {
     let tables = [
-        crate::capture::TableSpec::new("trips", crate::capture::CaptureMode::Full),
-        crate::capture::TableSpec::new("seen_airborne", crate::capture::CaptureMode::After),
-        crate::capture::TableSpec::new("flights_all_slice", crate::capture::CaptureMode::After),
-        crate::capture::TableSpec::new("flights_all_day", crate::capture::CaptureMode::After),
+        TableSpec::new("trips", CaptureMode::Full),
+        TableSpec::new("seen_airborne", CaptureMode::After),
+        TableSpec::new("flights_all_slice", CaptureMode::After),
+        TableSpec::new("flights_all_day", CaptureMode::After),
     ];
-    crate::capture::install(
-        conn,
-        &crate::capture::CaptureConfig::new(DB_NAME, path, &tables),
-    )
+    install(conn, &CaptureConfig::new(DB_NAME, path, &tables))
 }
 
 fn migrate_strict(conn: &Connection) -> Result<()> {
-    if crate::capture::table_is_strict(conn, "trips")? {
+    if table_is_strict(conn, "trips")? {
         return Ok(());
     }
     conn.pragma_update(None, "foreign_keys", "OFF")?;

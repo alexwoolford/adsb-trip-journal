@@ -13,6 +13,7 @@ name = "adsb-trip-journal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "capturable-state",
  "chrono",
  "clap",
  "csv",
@@ -161,6 +162,17 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "capturable-state"
+version = "0.1.0"
+source = "git+https://github.com/alexwoolford/capturable-state?tag=v0.1.0#9ab92742deaf8c9e743a901667db3350789e5999"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cc"

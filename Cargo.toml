@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Restartable trip journal for mapped corporate tails (OpenSky REST)"
+repository = "https://github.com/alexwoolford/adsb-trip-journal"
 rust-version = "1.80"
 
 [lib]
@@ -16,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+capturable-state = { git = "https://github.com/alexwoolford/capturable-state", tag = "v0.1.0" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
