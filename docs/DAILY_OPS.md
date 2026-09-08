@@ -83,6 +83,16 @@ journalctl -u adsb-trip-journal-collect.service -n 50 --no-pager
 sudo -u adsb /opt/adsb-trip-journal/scripts/run-status.sh
 ```
 
+## Timer failed
+
+`Persistent=true` will retry after a reboot. It will not page you.
+
+1. `systemctl is-failed adsb-trip-journal-collect.service` and `systemctl list-timers 'adsb-trip-journal-*'`.
+2. `journalctl -u adsb-trip-journal-collect.service -n 80 --no-pager`. 401/403 on OpenSky is credentials. Missing mapping sqlite is `TAIL_TO_TICKER_SQLITE`. 429 should resume from slice cache.
+3. Confirm host env `OPENSKY_MAX_FLIGHTS_CREDITS=3600` (wrapper default is 800 if unset). `install.sh` does not overwrite an existing env file.
+4. Leave `trips.sqlite` in place. Re-run: `sudo systemctl start adsb-trip-journal-collect.service`.
+5. `sudo -u adsb /opt/adsb-trip-journal/scripts/run-status.sh` — yesterday UTC should reach 12/12 slices unless the credit cap stopped the walk-back.
+
 Manual collect:
 
 ```bash
