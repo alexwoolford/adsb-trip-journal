@@ -21,7 +21,7 @@ Operator logs: `tracing` on stderr → journald (`SyslogIdentifier` matches the 
 | Job | Unit | Behavior |
 |---|---|---|
 | **Watch** | `adsb-trip-journal-watch.service` | **Optional** diagnostic; `install.sh` does **not** enable it. Long-running `/states/all` every 10 min. icao24-filtered calls cost **4** states-credits each (not serial-only 1). Fleet is chunked by 80 hexes, so ~331 hexes = 5 calls ≈ **20** credits/poll. Record `seen_airborne` for today UTC (collect does not use this as an allow-list or resume signal). Reloads the mapping fleet each poll. Enable by hand for a “who is up” poll. |
-| **Collect** | `adsb-trip-journal-collect.timer` | Daily **06:00 UTC** + up to 15 min jitter. Twelve `GET /flights/all` slices for yesterday UTC, then leftover flights credits walk back over never-started or incomplete days in a **90-day** repair window. Filter to the mapped fleet; persist fleet-filtered JSON. Day complete only after 12/12. Host cap `OPENSKY_MAX_FLIGHTS_CREDITS` **3600** (~10 UTC days/run, ~400 slack). CLI/laptop default **800**. `install.sh` does not overwrite an existing env file. |
+| **Collect** | `adsb-trip-journal-collect.timer` | Daily **06:00 UTC** + up to 15 min jitter. Twelve `GET /flights/all` slices for yesterday UTC, then leftover flights credits walk **newest-first** over never-started or incomplete days (no 90-day floor). A never-started historical day starts only when remaining ≥ **360**; incomplete days resume. Filter to the mapped fleet; persist fleet-filtered JSON. Day complete only after 12/12. Host cap `OPENSKY_MAX_FLIGHTS_CREDITS` **3600** (~10 UTC days/run, ~400 slack). CLI/laptop default **800**. `install.sh` does not overwrite an existing env file. |
 
 404 on `/flights/all` for a 2h global window is rare (empty interval). 429 does not mark remaining slices complete. Registrant is not operator. Coverage is thinner than ADS-B Exchange (no MLAT).
 
@@ -50,7 +50,7 @@ Units in [`deploy/systemd/`](../deploy/systemd/):
 
 Config: `/opt/adsb-trip-journal/etc/adsb-trip-journal.env` (from [`deploy/adsb-trip-journal.env.example`](../deploy/adsb-trip-journal.env.example), **chmod 600**). Install does not overwrite an existing env file.
 
-First collect after a new install covers yesterday via `/flights/all`, then walks back never-started days in the 90-day window until the host cap. A partial first UTC day of watch is unrelated to collect completeness. Watch does not pull collect `--from` backward.
+First collect after a new install covers yesterday via `/flights/all`, then walks **newest-first** over never-started days until leftover credits cannot buy another whole UTC day (360). A partial first UTC day of watch is unrelated to collect completeness. Watch does not change collect order.
 
 ## Layout
 
@@ -60,6 +60,8 @@ First collect after a new install covers yesterday via `/flights/all`, then walk
   scripts/run-watch.sh
   scripts/run-collect.sh
   scripts/run-status.sh
+  scripts/run-gc.sh
+  scripts/run-invalidate.sh
   docs/DAILY_OPS.md
   etc/adsb-trip-journal.env
 /var/lib/adsb-trip-journal/
@@ -82,6 +84,39 @@ journalctl -u adsb-trip-journal-collect.service -n 50 --no-pager
 # Does not need the 600 env file (paths are baked into the wrapper).
 sudo -u adsb /opt/adsb-trip-journal/scripts/run-status.sh
 ```
+
+Production journal is **only** `/var/lib/adsb-trip-journal/trips.sqlite`. Do not rsync a laptop `data/trips.sqlite` onto the host (unit-test fixture `abcdef` / `N1` leaked that way once).
+
+## Schema change after 12/12 (invalidate / gc)
+
+Completeness is a **credit lock**, not a schema version. A binary that grows `trips` columns (`callsign`, airport-quality ints) does **not** re-GET complete days. To backfill:
+
+1. Check one gzip: `gzip -dc /var/lib/adsb-trip-journal/cache/flights_all/YYYY-MM-DD/00.json.gz | head` — if `"callsign"` is in the FlightObject, keep the cache.
+2. Unlock: `sudo -u adsb /opt/adsb-trip-journal/scripts/run-invalidate.sh --from YYYY-MM-DD --to YYYY-MM-DD` (keep-cache default). Next `collect.timer` newest-first walk replays gzips; **0 flights credits**.
+3. To re-GET instead: add `--drop-cache` (360 flights-credits per UTC day).
+
+Forward-only purge (no unlock, no spend): drop the unit-test fixture and UTC days that never stored callsign **and** never stored `dep_airport_horiz_m`:
+
+```bash
+sudo -u adsb /opt/adsb-trip-journal/scripts/run-gc.sh
+sudo -u adsb /opt/adsb-trip-journal/scripts/run-gc.sh --apply
+```
+
+Those days stay 12/12. Mosaic follows via `_outbox` `D` after drain. Do not add a silent ingest-schema bump that spends the flights bucket.
+
+Each `trips` row is one hop. A same-day Tulsa→Houston→Tulsa day is two rows. OpenSky airport labels farther than 8 km are not landings: collect spends **tracks** credits (4 each, 4,000/day bucket) to snap `/tracks` endpoints. Re-GET `/flights/all` (`invalidate --drop-cache`) returns the same FlightObjects and does **not** fix bad idents.
+
+To rebuild a cached UTC day (0 flights credits; tracks only for untrusted legs):
+
+```bash
+# After deploying a binary that skips same-ident / far-horiz guesses:
+sudo -u adsb /usr/local/bin/sqlite3 /var/lib/adsb-trip-journal/trips.sqlite \
+  "DELETE FROM trips WHERE substr(dep_ts,1,10) = 'YYYY-MM-DD';"
+sudo -u adsb /opt/adsb-trip-journal/scripts/run-invalidate.sh --from YYYY-MM-DD --to YYYY-MM-DD
+sudo -u adsb /opt/adsb-trip-journal/scripts/run-collect.sh --from YYYY-MM-DD --to YYYY-MM-DD
+```
+
+Leave the collector running so `_outbox` drains. Do not `--drop-cache` unless the gzip is missing fields. If `/tracks` returns 429, replay with `--no-tracks-fallback` to keep hops whose OpenSky idents are inside 8 km; invalidate and collect again when the tracks bucket resets (4,000/day, separate from flights).
 
 ## Timer failed
 
@@ -112,8 +147,8 @@ TAIL_TO_TICKER_SQLITE=/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite
 ## Credit budget
 
 - Watch: ~**20** states-credits/poll × 144 ≈ **2,880**/day of the 4,000 **states** bucket (icao24 filter is 4/call × 5 chunks for a ~331-hex fleet). Independent of flights. Optional; collect does not spend this.
-- Collect: **12 × `/flights/all`** per UTC day of the **flights** bucket (**30**/slice measured 2026-09-03 = **360**/day). Host cap **3600** (CLI/laptop **800**). After yesterday, leftover credits fill never-started or incomplete days in a **90-day** window (oldest first). When that window is 12/12, leftover credits stay unused. `--hex` does not shrink the cache. Ingest keeps the full FlightObject on mapped rows: `callsign` (label, often null) plus airport-estimate quality integers. Existing complete days are not re-fetched to backfill those columns.
-- Tracks fallback only when both airport estimates are missing (tracks bucket). Successful (and empty) `/tracks` attempts are cached per slice so a 429 resume does not re-call the same `icao24+firstSeen`. Track `callsign` fills the trip only when the FlightObject had none.
+- Collect: **12 × `/flights/all`** per UTC day of the **flights** bucket (**30**/slice measured 2026-09-03 = **360**/day). Host cap **3600** (CLI/laptop **800**). After yesterday, leftover credits fill **newer-first** history (whole UTC days). Do not start a never-started historical day unless remaining ≥ **360**; resume incomplete days. Cached slices cost 0. `--hex` does not shrink the cache. Ingest keeps the full FlightObject on mapped rows: `callsign` (label, often null) plus airport-estimate quality integers. Complete days are not re-GET unless an operator runs `invalidate`. Default `invalidate` keeps gzip caches so the next collect **replays** FlightObjects (no credits). `--drop-cache` re-GETs. `gc --apply` deletes fixture / pre-payload days without unlocking 12/12.
+- Tracks fallback when **either** OpenSky airport ident is missing, not in OurAirports, or farther than 8 km (tracks bucket). Successful (and empty) `/tracks` attempts are cached per slice so a 429 resume does not re-call the same `icao24+firstSeen`. Track `callsign` fills the trip only when the FlightObject had none.
 
 ## Limits
 

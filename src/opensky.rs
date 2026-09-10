@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::airports::AirportIndex;
+use crate::airports::{estimate_horiz_ok, AirportIndex};
 use crate::fleet::FleetRow;
 use crate::store::{utc_iso, TripRow, TripSource};
 
@@ -42,10 +42,9 @@ pub const FLIGHTS_ALL_SLICE_SECS: i64 = 7_200;
 pub const FLIGHTS_ALL_SLICE_CREDITS: u32 = 30;
 const STATES_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const FLIGHTS_ALL_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
-/// Rolling repair window: never-started or incomplete `/flights/all` days
-/// inside this many UTC days before yesterday. Watch `seen_airborne` is not
-/// used. Incomplete slice rows older than the window still resume.
-pub const FLIGHTS_ALL_LOOKBACK_DAYS: u64 = 90;
+/// Twelve historical slices at [`FLIGHTS_ALL_SLICE_CREDITS`] (360). Leftover
+/// credits start a never-started UTC day only when this much remains.
+pub const FLIGHTS_ALL_DAY_CREDITS: u32 = FLIGHTS_ALL_SLICES_PER_DAY * FLIGHTS_ALL_SLICE_CREDITS;
 
 /// How many `/states/all` requests a fleet of `n_hexes` needs at [`HEX_CHUNK`].
 pub fn states_request_count(n_hexes: usize) -> u32 {
@@ -800,6 +799,36 @@ pub fn parse_track_endpoints(bytes: &[u8]) -> Option<TrackEnds> {
     })
 }
 
+fn nonempty_ident(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// OpenSky ident is a landing label only when it is in OurAirports and horiz. error
+/// is inside [`crate::airports::SNAP_RADIUS_KM`].
+pub fn end_estimate_trusted(
+    ident: Option<&str>,
+    horiz_m: Option<i64>,
+    airports: &AirportIndex,
+) -> bool {
+    nonempty_ident(ident)
+        .and_then(|id| airports.by_ident(id))
+        .is_some()
+        && estimate_horiz_ok(horiz_m)
+}
+
+/// Fetch `/tracks` when either end is missing or the OpenSky ident is too far.
+pub fn flight_needs_track(flight: &Flight, airports: &AirportIndex) -> bool {
+    !end_estimate_trusted(
+        flight.est_departure_airport.as_deref(),
+        flight.est_departure_airport_horiz_distance,
+        airports,
+    ) || !end_estimate_trusted(
+        flight.est_arrival_airport.as_deref(),
+        flight.est_arrival_airport_horiz_distance,
+        airports,
+    )
+}
+
 pub fn flight_to_trip(
     flight: &Flight,
     row: &FleetRow,
@@ -808,34 +837,82 @@ pub fn flight_to_trip(
     fetched_at: &str,
     source: TripSource,
 ) -> Option<TripRow> {
-    let dep_ident = flight
-        .est_departure_airport
-        .as_deref()
-        .filter(|s| !s.is_empty());
-    let arr_ident = flight
-        .est_arrival_airport
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    let dep_ident = nonempty_ident(flight.est_departure_airport.as_deref());
+    let arr_ident = nonempty_ident(flight.est_arrival_airport.as_deref());
     let dep_ap = dep_ident.and_then(|id| airports.by_ident(id));
     let arr_ap = arr_ident.and_then(|id| airports.by_ident(id));
+    let dep_trusted =
+        dep_ap.is_some() && estimate_horiz_ok(flight.est_departure_airport_horiz_distance);
+    let arr_trusted =
+        arr_ap.is_some() && estimate_horiz_ok(flight.est_arrival_airport_horiz_distance);
 
-    let mut dep_lat = dep_ap.map(|a| a.lat);
-    let mut dep_lon = dep_ap.map(|a| a.lon);
-    let mut arr_lat = arr_ap.map(|a| a.lat);
-    let mut arr_lon = arr_ap.map(|a| a.lon);
+    if dep_trusted && arr_trusted && dep_ident.is_some() && dep_ident == arr_ident {
+        return None;
+    }
+    // Don't keep a named-but-untrusted arrival without a track to snap.
+    if arr_ident.is_some() && !arr_trusted && track.is_none() {
+        return None;
+    }
+
+    let mut dep_lat = if dep_trusted {
+        dep_ap.map(|a| a.lat)
+    } else {
+        None
+    };
+    let mut dep_lon = if dep_trusted {
+        dep_ap.map(|a| a.lon)
+    } else {
+        None
+    };
+    let mut arr_lat = if arr_trusted {
+        arr_ap.map(|a| a.lat)
+    } else {
+        None
+    };
+    let mut arr_lon = if arr_trusted {
+        arr_ap.map(|a| a.lon)
+    } else {
+        None
+    };
 
     if let Some(t) = track.as_ref() {
-        if dep_lat.is_none() {
+        if !dep_trusted {
             dep_lat = Some(t.dep_lat);
             dep_lon = Some(t.dep_lon);
         }
-        if arr_lat.is_none() {
+        if !arr_trusted {
             arr_lat = Some(t.arr_lat);
             arr_lon = Some(t.arr_lon);
         }
     }
 
     let (dep_lat, dep_lon) = (dep_lat?, dep_lon?);
+
+    let dep_snap = if dep_trusted {
+        crate::airports::Snap {
+            ident: dep_ident.map(|s| s.to_string()),
+            place: dep_ident.unwrap().to_string(),
+        }
+    } else {
+        airports.snap(dep_lat, dep_lon)
+    };
+    let arr_snap = if arr_trusted {
+        crate::airports::Snap {
+            ident: arr_ident.map(|s| s.to_string()),
+            place: arr_ident.unwrap().to_string(),
+        }
+    } else if let (Some(la), Some(lo)) = (arr_lat, arr_lon) {
+        airports.snap(la, lo)
+    } else {
+        crate::airports::Snap {
+            ident: None,
+            place: String::new(),
+        }
+    };
+
+    if dep_snap.ident.is_some() && dep_snap.ident == arr_snap.ident {
+        return None;
+    }
 
     let dep_ts = Utc
         .timestamp_opt(flight.first_seen, 0)
@@ -846,14 +923,11 @@ pub fn flight_to_trip(
         .and_then(|t| Utc.timestamp_opt(t, 0).single())
         .map(utc_iso);
 
-    let dep_place = dep_ident
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| crate::airports::format_latlon(dep_lat, dep_lon));
-    let arr_place = arr_ident.map(|s| s.to_string()).or_else(|| {
-        arr_lat
-            .zip(arr_lon)
-            .map(|(la, lo)| crate::airports::format_latlon(la, lo))
-    });
+    let arr_place = if arr_lat.is_some() && !arr_snap.place.is_empty() {
+        Some(arr_snap.place.clone())
+    } else {
+        None
+    };
 
     let callsign = flight
         .callsign
@@ -871,13 +945,9 @@ pub fn flight_to_trip(
         dep_lon: Some(dep_lon),
         arr_lat,
         arr_lon,
-        dep_airport: dep_ident
-            .filter(|_| dep_ap.is_some())
-            .map(|s| s.to_string()),
-        arr_airport: arr_ident
-            .filter(|_| arr_ap.is_some())
-            .map(|s| s.to_string()),
-        dep_place: Some(dep_place),
+        dep_airport: dep_snap.ident,
+        arr_airport: arr_snap.ident,
+        dep_place: Some(dep_snap.place),
         arr_place,
         source: source.as_str().to_string(),
         fetched_at: fetched_at.to_string(),
@@ -979,7 +1049,7 @@ mod tests {
         assert_eq!(FLIGHTS_CALL_CREDITS, 30);
         assert_eq!(FLIGHTS_ALL_SLICE_CREDITS, 30);
         assert_eq!(DEFAULT_MAX_FLIGHTS_CREDITS, 800);
-        assert_eq!(FLIGHTS_ALL_LOOKBACK_DAYS, 90);
+        assert_eq!(FLIGHTS_ALL_DAY_CREDITS, 360);
     }
 
     #[test]
@@ -1272,5 +1342,144 @@ mod tests {
         assert_eq!(trip.callsign.as_deref(), Some("DCM123"));
         assert_eq!(trip.dep_airport_horiz_m, Some(100));
         assert_eq!(trip.arr_airport_candidates, Some(2));
+    }
+
+    #[test]
+    fn june8_gzip_same_airport_fragments_are_skipped() {
+        let csv = "ident,type,latitude_deg,longitude_deg
+KAND,medium_airport,34.4946,-82.7094
+KSRQ,medium_airport,27.3954,-82.5544
+KAVX,small_airport,33.4050,-118.4158
+KROG,small_airport,36.3723,-94.1069
+KCLT,large_airport,35.2140,-80.9431
+SC97,small_airport,34.8000,-82.7000
+KCNO,small_airport,33.9747,-117.6386
+";
+        let idx = AirportIndex::from_reader(csv.as_bytes()).unwrap();
+        let raw = br#"[
+{"icao24":"a5befd","firstSeen":1780922929,"lastSeen":1780924914,"callsign":"N47CK","estDepartureAirport":"KCLT","estArrivalAirport":"SC97","estDepartureAirportHorizDistance":7971,"estArrivalAirportHorizDistance":10750,"departureAirportCandidatesCount":1,"arrivalAirportCandidatesCount":13},
+{"icao24":"a5befd","firstSeen":1780928318,"lastSeen":1780929083,"callsign":"N47CK","estDepartureAirport":"KAND","estArrivalAirport":"KAND","estDepartureAirportHorizDistance":4298,"estArrivalAirportHorizDistance":5204,"departureAirportCandidatesCount":0,"arrivalAirportCandidatesCount":10},
+{"icao24":"a98020","firstSeen":1780935193,"lastSeen":1780936301,"callsign":"N711DS","estDepartureAirport":"KSRQ","estArrivalAirport":"KSRQ","estDepartureAirportHorizDistance":868,"estArrivalAirportHorizDistance":1199,"departureAirportCandidatesCount":0,"arrivalAirportCandidatesCount":3},
+{"icao24":"a1a4cd","firstSeen":1780944544,"lastSeen":1780945949,"callsign":"N205CE","estDepartureAirport":"KAVX","estArrivalAirport":"KAVX","estDepartureAirportHorizDistance":12338,"estArrivalAirportHorizDistance":12336,"departureAirportCandidatesCount":0,"arrivalAirportCandidatesCount":0},
+{"icao24":"a0ef95","firstSeen":1780961112,"lastSeen":1780962928,"callsign":"N16CP","estDepartureAirport":"KROG","estArrivalAirport":"KROG","estDepartureAirportHorizDistance":1171,"estArrivalAirportHorizDistance":2629,"departureAirportCandidatesCount":5,"arrivalAirportCandidatesCount":12},
+{"icao24":"a1a4cd","firstSeen":1780956604,"lastSeen":1780959922,"callsign":"N205CE","estDepartureAirport":"KAVX","estArrivalAirport":"KCNO","estDepartureAirportHorizDistance":12329,"estArrivalAirportHorizDistance":513,"departureAirportCandidatesCount":0,"arrivalAirportCandidatesCount":6}
+]"#;
+        let flights = parse_flights(raw).unwrap();
+        let collapsed = crate::collect::collapse_near_duplicate_flights(&flights);
+        assert_eq!(collapsed.len(), flights.len());
+        let row = FleetRow {
+            n_number: "NTEST".into(),
+            icao24: "abcdef".into(),
+            ticker: "AAA".into(),
+            cik: None,
+            company_name: None,
+            make: None,
+            model: None,
+            registrant_name: None,
+            match_method: None,
+            aviation_issuer: 0,
+            fleet_size: 1,
+            as_of_date: None,
+        };
+        let mut skipped = 0u32;
+        for f in &collapsed {
+            let mut r = row.clone();
+            r.icao24 = f.icao24.clone();
+            let trip = flight_to_trip(
+                f,
+                &r,
+                &idx,
+                None,
+                "2026-09-07T06:07:13Z",
+                TripSource::OpenskyFlights,
+            );
+            assert!(
+                trip.is_none(),
+                "same-ident or untrusted OpenSky pair without a track must not become a hop"
+            );
+            skipped += 1;
+        }
+        assert_eq!(skipped, 6);
+    }
+
+    #[test]
+    fn far_horiz_without_track_is_skipped() {
+        let csv = "ident,type,latitude_deg,longitude_deg\nKAPA,large_airport,39.5701,-104.6737\nKJFK,large_airport,40.6399,-73.7787\n";
+        let idx = AirportIndex::from_reader(csv.as_bytes()).unwrap();
+        let row = FleetRow {
+            n_number: "N1".into(),
+            icao24: "abcdef".into(),
+            ticker: "AAA".into(),
+            cik: None,
+            company_name: None,
+            make: None,
+            model: None,
+            registrant_name: None,
+            match_method: None,
+            aviation_issuer: 0,
+            fleet_size: 1,
+            as_of_date: None,
+        };
+        let flight = Flight {
+            icao24: "abcdef".into(),
+            first_seen: 1_705_276_800,
+            last_seen: Some(1_705_280_400),
+            est_departure_airport: Some("KAPA".into()),
+            est_arrival_airport: Some("KJFK".into()),
+            est_departure_airport_horiz_distance: Some(12_000),
+            est_arrival_airport_horiz_distance: Some(12_000),
+            ..Default::default()
+        };
+        assert!(flight_needs_track(&flight, &idx));
+        assert!(
+            flight_to_trip(&flight, &row, &idx, None, "t", TripSource::OpenskyFlights,).is_none()
+        );
+    }
+
+    #[test]
+    fn far_horiz_track_snaps_real_endpoints() {
+        let csv = "ident,type,latitude_deg,longitude_deg\nKAPA,large_airport,39.5701,-104.6737\nKJFK,large_airport,40.6399,-73.7787\n";
+        let idx = AirportIndex::from_reader(csv.as_bytes()).unwrap();
+        let row = FleetRow {
+            n_number: "N1".into(),
+            icao24: "abcdef".into(),
+            ticker: "AAA".into(),
+            cik: None,
+            company_name: None,
+            make: None,
+            model: None,
+            registrant_name: None,
+            match_method: None,
+            aviation_issuer: 0,
+            fleet_size: 1,
+            as_of_date: None,
+        };
+        let flight = Flight {
+            icao24: "abcdef".into(),
+            first_seen: 1_705_276_800,
+            last_seen: Some(1_705_280_400),
+            est_departure_airport: Some("KAPA".into()),
+            est_arrival_airport: Some("KJFK".into()),
+            est_departure_airport_horiz_distance: Some(12_000),
+            est_arrival_airport_horiz_distance: Some(12_000),
+            ..Default::default()
+        };
+        let trip = flight_to_trip(
+            &flight,
+            &row,
+            &idx,
+            Some(TrackEnds {
+                dep_lat: 39.5701,
+                dep_lon: -104.6737,
+                arr_lat: 40.6399,
+                arr_lon: -73.7787,
+                callsign: None,
+            }),
+            "t",
+            TripSource::OpenskyFlights,
+        )
+        .unwrap();
+        assert_eq!(trip.dep_airport.as_deref(), Some("KAPA"));
+        assert_eq!(trip.arr_airport.as_deref(), Some("KJFK"));
     }
 }

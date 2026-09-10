@@ -74,6 +74,30 @@ pub struct JournalStatus {
     pub flights_all_errors: Vec<(String, String)>,
 }
 
+/// Unit-test aircraft (`store` tests / isolation fixtures). Valid Mode S hex;
+/// not banned at upsert. Production collect never maps it.
+pub const TEST_FIXTURE_ICAO24: &str = "abcdef";
+pub const TEST_FIXTURE_N_NUMBER: &str = "N1";
+
+#[derive(Debug, Clone, Default)]
+pub struct GcReport {
+    pub dry_run: bool,
+    pub fixture_trips: u64,
+    pub payloadless_days: Vec<String>,
+    pub payloadless_trips: u64,
+    pub trips_deleted: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InvalidateReport {
+    pub from: String,
+    pub to: String,
+    pub slices_deleted: u64,
+    pub day_rows_deleted: u64,
+    pub cache_files_removed: u64,
+    pub drop_cache: bool,
+}
+
 pub struct JournalDb {
     conn: Connection,
     nudge: Nudge,
@@ -274,6 +298,110 @@ impl JournalDb {
             .query_row("SELECT COUNT(*) FROM trips", [], |r| r.get(0))?)
     }
 
+    /// Clear `/flights/all` completeness for `from..=to` (inclusive UTC dates).
+    /// Trips and gzip caches are left alone; the next collect walk-back replays
+    /// cache (or re-GETs if the operator also deleted the gzips).
+    pub fn invalidate_flights_all_range(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<(u64, u64)> {
+        let _ = utc_dates_inclusive(from, to)?;
+        let slices = self.conn.execute(
+            "DELETE FROM flights_all_slice WHERE utc_date >= ?1 AND utc_date <= ?2",
+            params![from.to_string(), to.to_string()],
+        )? as u64;
+        let days = self.conn.execute(
+            "DELETE FROM flights_all_day WHERE utc_date >= ?1 AND utc_date <= ?2",
+            params![from.to_string(), to.to_string()],
+        )? as u64;
+        self.nudge.send();
+        Ok((slices, days))
+    }
+
+    pub fn count_fixture_trips(&self) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM trips WHERE icao24 = ?1 AND n_number = ?2",
+            params![TEST_FIXTURE_ICAO24, TEST_FIXTURE_N_NUMBER],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// UTC calendar days of `dep_ts` where no trip stored a callsign and no trip
+    /// stored `dep_airport_horiz_m` (the FlightObject quality ints added in the
+    /// same upsert as callsign).
+    pub fn list_payloadless_days(&self) -> Result<Vec<NaiveDate>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT substr(dep_ts, 1, 10) AS utc_date
+            FROM trips
+            GROUP BY 1
+            HAVING MAX(CASE WHEN callsign IS NOT NULL AND trim(callsign) <> '' THEN 1 ELSE 0 END) = 0
+               AND MAX(CASE WHEN dep_airport_horiz_m IS NOT NULL THEN 1 ELSE 0 END) = 0
+            ORDER BY 1
+            "#,
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for date in rows {
+            let s = date?;
+            let d = NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                .with_context(|| format!("payloadless utc_date {s}"))?;
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    pub fn count_trips_on_day(&self, date: NaiveDate) -> Result<u64> {
+        let (start, end) = utc_day_bounds(date);
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM trips WHERE dep_ts >= ?1 AND dep_ts < ?2",
+            params![start, end],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    pub fn preview_gc(&self) -> Result<GcReport> {
+        let days = self.list_payloadless_days()?;
+        let mut payloadless_trips = 0u64;
+        let mut payloadless_days = Vec::new();
+        for d in &days {
+            payloadless_trips += self.count_trips_on_day(*d)?;
+            payloadless_days.push(d.to_string());
+        }
+        Ok(GcReport {
+            dry_run: true,
+            fixture_trips: self.count_fixture_trips()?,
+            payloadless_days,
+            payloadless_trips,
+            trips_deleted: 0,
+        })
+    }
+
+    /// Hard-delete the unit-test fixture and trips on payloadless UTC days.
+    /// Does not touch `flights_all_slice` (those days stay 12/12).
+    pub fn apply_gc(&self) -> Result<GcReport> {
+        let mut report = self.preview_gc()?;
+        report.dry_run = false;
+        let mut deleted = self.conn.execute(
+            "DELETE FROM trips WHERE icao24 = ?1 AND n_number = ?2",
+            params![TEST_FIXTURE_ICAO24, TEST_FIXTURE_N_NUMBER],
+        )? as u64;
+        for s in &report.payloadless_days {
+            let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")?;
+            let (start, end) = utc_day_bounds(d);
+            deleted += self.conn.execute(
+                "DELETE FROM trips WHERE dep_ts >= ?1 AND dep_ts < ?2",
+                params![start, end],
+            )? as u64;
+        }
+        report.trips_deleted = deleted;
+        self.nudge.send();
+        Ok(report)
+    }
+
     pub fn get_trip(&self, icao24: &str, dep_ts: &str) -> Result<Option<TripRow>> {
         self.conn
             .query_row(
@@ -391,17 +519,7 @@ impl JournalDb {
     }
 
     pub fn has_trips_on(&self, date: NaiveDate) -> Result<bool> {
-        let start = format!("{date}T00:00:00Z");
-        let end = date
-            .succ_opt()
-            .map(|n| format!("{n}T00:00:00Z"))
-            .unwrap_or_else(|| format!("{date}T23:59:59Z"));
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM trips WHERE dep_ts >= ?1 AND dep_ts < ?2",
-            params![start, end],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        Ok(self.count_trips_on_day(date)? > 0)
     }
 
     /// `(icao24, firstSeen unix)` for trips whose `dep_ts` falls in `[begin, end]` inclusive.
@@ -426,49 +544,6 @@ impl JournalDb {
             }
         }
         Ok(out)
-    }
-
-    /// Oldest UTC date in the lookback window that still needs `/flights/all`
-    /// slices (never started or incomplete), else `yesterday`. Incomplete slice
-    /// rows older than the window still resume. Watch `seen_airborne` does not
-    /// pull the start date backward.
-    pub fn default_opensky_collect_from(
-        &self,
-        yesterday: NaiveDate,
-        n_slices: u32,
-        lookback_days: u64,
-    ) -> Result<NaiveDate> {
-        let floor = yesterday
-            .checked_sub_days(chrono::Days::new(lookback_days))
-            .unwrap_or(yesterday);
-        let mut start = yesterday;
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT utc_date, COUNT(*) FROM flights_all_slice GROUP BY utc_date")?;
-        let slice_rows =
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        for row in slice_rows {
-            let (date_s, n) = row?;
-            let Some(d) = NaiveDate::parse_from_str(&date_s, "%Y-%m-%d").ok() else {
-                continue;
-            };
-            if d <= yesterday && (n as u32) < n_slices && d < start {
-                start = d;
-            }
-        }
-
-        let mut d = floor;
-        while d <= yesterday {
-            if d < start && !self.flights_all_day_complete(d, n_slices)? {
-                start = d;
-            }
-            d = match d.succ_opt() {
-                Some(n) => n,
-                None => break,
-            };
-        }
-        Ok(start)
     }
 
     pub fn status(&self, path: &Path) -> Result<JournalStatus> {
@@ -764,6 +839,33 @@ pub fn utc_iso(dt: DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+pub fn utc_dates_inclusive(from: NaiveDate, to: NaiveDate) -> Result<Vec<NaiveDate>> {
+    if to < from {
+        anyhow::bail!("--to {to} is before --from {from}");
+    }
+    let mut out = Vec::new();
+    let mut d = from;
+    loop {
+        out.push(d);
+        if d == to {
+            break;
+        }
+        d = d
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("date overflow after {d}"))?;
+    }
+    Ok(out)
+}
+
+fn utc_day_bounds(date: NaiveDate) -> (String, String) {
+    let start = format!("{date}T00:00:00Z");
+    let end = date
+        .succ_opt()
+        .map(|n| format!("{n}T00:00:00Z"))
+        .unwrap_or_else(|| format!("{date}T23:59:59Z"));
+    (start, end)
+}
+
 fn unix_to_iso(ts: i64) -> Option<String> {
     Utc.timestamp_opt(ts, 0).single().map(utc_iso)
 }
@@ -1026,115 +1128,25 @@ mod tests {
     }
 
     #[test]
-    fn flights_all_slice_resume_and_default_from() {
+    fn flights_all_slice_resume_until_12() {
         let dir = tempdir().unwrap();
         let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
-        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
         db.mark_flights_all_slice_ok(d, 0).unwrap();
         db.mark_flights_all_slice_ok(d, 1).unwrap();
         assert_eq!(db.flights_all_slices_done(d).unwrap(), 2);
         assert!(!db.flights_all_day_complete(d, 12).unwrap());
-        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        let floor = yesterday.checked_sub_days(chrono::Days::new(14)).unwrap();
-        assert_eq!(
-            start, floor,
-            "never-started days in lookback resume from the floor; incomplete Sep 3 is not older"
-        );
         for i in 2..12 {
             db.mark_flights_all_slice_ok(d, i).unwrap();
         }
         assert!(db.flights_all_day_complete(d, 12).unwrap());
-        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(
-            start, floor,
-            "complete Sep 3 does not skip empty lookback days behind it"
-        );
     }
 
     #[test]
-    fn default_from_empty_window_starts_at_lookback_floor() {
-        let dir = tempdir().unwrap();
-        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
-        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(
-            start,
-            yesterday.checked_sub_days(chrono::Days::new(14)).unwrap()
-        );
-        let start90 = db.default_opensky_collect_from(yesterday, 12, 90).unwrap();
-        assert_eq!(
-            start90,
-            yesterday.checked_sub_days(chrono::Days::new(90)).unwrap()
-        );
-    }
-
-    #[test]
-    fn default_from_resumes_incomplete_slices_older_than_lookback() {
-        let dir = tempdir().unwrap();
-        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
-        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-        let old = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
-        db.mark_flights_all_slice_ok(old, 0).unwrap();
-        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(start, old);
-    }
-
-    #[test]
-    fn default_from_yesterday_only_when_lookback_complete() {
-        let dir = tempdir().unwrap();
-        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
-        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-        let floor = yesterday.checked_sub_days(chrono::Days::new(14)).unwrap();
-        let mut d = floor;
-        while d <= yesterday {
-            for i in 0..12 {
-                db.mark_flights_all_slice_ok(d, i).unwrap();
-            }
-            d = d.succ_opt().unwrap();
-        }
-        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(start, yesterday);
-    }
-
-    #[test]
-    fn default_from_uses_never_started_days_inside_lookback() {
+    fn flights_all_429_does_not_mark_day_complete() {
         let dir = tempdir().unwrap();
         let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
-        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-        db.upsert_trip(&TripRow {
-            icao24: "abcdef".into(),
-            dep_ts: "2026-09-03T08:00:00Z".into(),
-            arr_ts: None,
-            n_number: "N1".into(),
-            ticker: "AAA".into(),
-            cik: None,
-            dep_lat: Some(1.0),
-            dep_lon: Some(2.0),
-            arr_lat: Some(3.0),
-            arr_lon: Some(4.0),
-            dep_airport: Some("KAPA".into()),
-            arr_airport: Some("KJFK".into()),
-            dep_place: Some("KAPA".into()),
-            arr_place: Some("KJFK".into()),
-            source: TripSource::OpenskyFlights.as_str().into(),
-            fetched_at: "2026-09-04T06:00:00Z".into(),
-            callsign: None,
-            dep_airport_horiz_m: None,
-            dep_airport_vert_m: None,
-            arr_airport_horiz_m: None,
-            arr_airport_vert_m: None,
-            dep_airport_candidates: None,
-            arr_airport_candidates: None,
-        })
-        .unwrap();
-        let start = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(
-            start,
-            yesterday.checked_sub_days(chrono::Days::new(14)).unwrap(),
-            "trips are not required; never-started days pull to the lookback floor"
-        );
         for i in 0..11 {
             db.mark_flights_all_slice_ok(d, i).unwrap();
         }
@@ -1144,22 +1156,13 @@ mod tests {
     }
 
     #[test]
-    fn default_from_ignores_seen_airborne() {
+    fn seen_airborne_does_not_mark_flights_all_complete() {
         let dir = tempdir().unwrap();
         let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
-        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-        let empty = JournalDb::open(&dir.path().join("empty.sqlite")).unwrap();
-        let without = empty
-            .default_opensky_collect_from(yesterday, 12, 14)
-            .unwrap();
         db.mark_seen_airborne("abcdef", d).unwrap();
-        let with = db.default_opensky_collect_from(yesterday, 12, 14).unwrap();
-        assert_eq!(with, without);
-        assert_eq!(
-            with,
-            yesterday.checked_sub_days(chrono::Days::new(14)).unwrap()
-        );
+        assert!(!db.flights_all_day_complete(d, 12).unwrap());
+        assert_eq!(db.flights_all_slices_done(d).unwrap(), 0);
     }
 
     #[test]
@@ -1280,5 +1283,139 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
         assert_eq!(mode.to_ascii_lowercase(), "wal");
+    }
+
+    fn trip_on(
+        icao24: &str,
+        n_number: &str,
+        dep_ts: &str,
+        callsign: Option<&str>,
+        horiz: Option<i64>,
+    ) -> TripRow {
+        TripRow {
+            icao24: icao24.into(),
+            dep_ts: dep_ts.into(),
+            arr_ts: None,
+            n_number: n_number.into(),
+            ticker: "AAA".into(),
+            cik: None,
+            dep_lat: Some(1.0),
+            dep_lon: Some(2.0),
+            arr_lat: None,
+            arr_lon: None,
+            dep_airport: Some("KAPA".into()),
+            arr_airport: None,
+            dep_place: Some("KAPA".into()),
+            arr_place: None,
+            source: TripSource::OpenskyFlights.as_str().into(),
+            fetched_at: "2026-09-05T06:00:00Z".into(),
+            callsign: callsign.map(str::to_string),
+            dep_airport_horiz_m: horiz,
+            dep_airport_vert_m: None,
+            arr_airport_horiz_m: None,
+            arr_airport_vert_m: None,
+            dep_airport_candidates: None,
+            arr_airport_candidates: None,
+        }
+    }
+
+    #[test]
+    fn invalidate_clears_slice_lock_not_trips() {
+        let dir = tempdir().unwrap();
+        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        for i in 0..12 {
+            db.mark_flights_all_slice_ok(d, i).unwrap();
+        }
+        assert!(db.flights_all_day_complete(d, 12).unwrap());
+        db.upsert_trip(&trip_on(
+            "a12c04",
+            "N175CT",
+            "2026-09-03T12:00:00Z",
+            None,
+            None,
+        ))
+        .unwrap();
+        let (slices, days) = db.invalidate_flights_all_range(d, d).unwrap();
+        assert_eq!(slices, 12);
+        assert_eq!(days, 1);
+        assert!(!db.flights_all_day_complete(d, 12).unwrap());
+        assert_eq!(db.trip_count().unwrap(), 1);
+        let ops = outbox_ops(&db);
+        assert!(ops
+            .iter()
+            .any(|(tbl, op)| tbl == "flights_all_slice" && op == "D"));
+    }
+
+    #[test]
+    fn utc_dates_inclusive_rejects_inverted_range() {
+        let from = NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        assert!(utc_dates_inclusive(from, to).is_err());
+        assert_eq!(utc_dates_inclusive(to, from).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn gc_drops_payloadless_and_fixture_keeps_payload_days() {
+        let dir = tempdir().unwrap();
+        let db = JournalDb::open(&dir.path().join("t.sqlite")).unwrap();
+        db.upsert_trip(&trip_on(
+            TEST_FIXTURE_ICAO24,
+            TEST_FIXTURE_N_NUMBER,
+            "2024-01-15T12:00:00Z",
+            None,
+            None,
+        ))
+        .unwrap();
+        db.upsert_trip(&trip_on(
+            "a12c04",
+            "N175CT",
+            "2026-09-03T08:00:00Z",
+            None,
+            None,
+        ))
+        .unwrap();
+        db.upsert_trip(&trip_on(
+            "a66d27",
+            "N513FX",
+            "2026-06-08T22:08:39Z",
+            Some("LXJ513"),
+            Some(8457),
+        ))
+        .unwrap();
+        db.upsert_trip(&trip_on(
+            "adc694",
+            "N987QS",
+            "2026-09-07T10:00:00Z",
+            None,
+            Some(100),
+        ))
+        .unwrap();
+        let preview = db.preview_gc().unwrap();
+        assert!(preview.dry_run);
+        assert_eq!(preview.fixture_trips, 1);
+        assert_eq!(preview.payloadless_days, vec!["2024-01-15", "2026-09-03"]);
+        assert_eq!(preview.trips_deleted, 0);
+        assert_eq!(db.trip_count().unwrap(), 4);
+
+        let applied = db.apply_gc().unwrap();
+        assert!(!applied.dry_run);
+        assert_eq!(applied.trips_deleted, 2);
+        assert_eq!(db.trip_count().unwrap(), 2);
+        assert!(db
+            .get_trip("a66d27", "2026-06-08T22:08:39Z")
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_trip("adc694", "2026-09-07T10:00:00Z")
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_trip(TEST_FIXTURE_ICAO24, "2024-01-15T12:00:00Z")
+            .unwrap()
+            .is_none());
+        assert!(outbox_ops(&db)
+            .iter()
+            .any(|(tbl, op)| tbl == "trips" && op == "D"));
     }
 }

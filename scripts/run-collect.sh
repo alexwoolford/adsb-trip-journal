@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Oneshot: collect yesterday UTC via 12× GET /flights/all (filter mapped fleet).
-# Then leftover credits fill never-started/incomplete days in the 90-day window.
+# Then leftover credits fill newer-first history (whole UTC days; stop when leftover < 360).
 # Wrapper default 800 (laptop). Production host env is 3600. Not gated on seen_airborne.
 set -euo pipefail
 
@@ -52,5 +52,5 @@ echo "bin=$BIN mapping=$MAPPING max_flights_credits=$MAX_CREDITS"
   --journal-sqlite "$JOURNAL" \
   --data-dir "$STATE" \
   --cache-dir "$CACHE" \
-  collect --max-flights-credits "$MAX_CREDITS"
+  collect --max-flights-credits "$MAX_CREDITS" "$@"
 echo "journal → $JOURNAL"
