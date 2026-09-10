@@ -168,7 +168,7 @@ Logical name: `adsb-trip-journal`. Watch the writable journal, not a copy.
 
 Capture set: `trips` (full), `seen_airborne` / `flights_all_slice` / `flights_all_day` (after). `fleet_snapshot` is DELETE+reload and is **not** captured. `fetch_cursor` is leftover and is **not** captured.
 
-Outbox/triggers come from [`capturable-state`](https://github.com/alexwoolford/capturable-state) `v0.1.0`, not a copied `capture.rs`.
+Outbox/triggers come from [`capturable-state`](https://github.com/alexwoolford/capturable-state) `v0.1.1`, not a copied `capture.rs`.
 
 Env (collector is `state-capture` on this host; missing socket is ignored):
 
