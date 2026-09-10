@@ -177,4 +177,4 @@ STATE_CAPTURE_SOCK=/run/state/collect.sock
 STATE_CAPTURE_ANNOUNCE_DIR=/var/lib/state-capture/announce
 ```
 
-If the announce dir cannot be created, `open()` writes `{sqlite_dir}/.capturable.json`.
+If the announce dir cannot be created, announce is skipped (collector absent). If it exists but is not writable, `install` fails — no sibling `.capturable.json`. `ProtectSystem=strict` therefore includes `/var/lib/state-capture/announce` and `/run/state` in `ReadWritePaths`.
