@@ -23,9 +23,13 @@ Operator logs: `tracing` on stderr → journald (`SyslogIdentifier` matches the 
 | **Watch** | `adsb-trip-journal-watch.service` | **Optional** diagnostic; `install.sh` does **not** enable it. Long-running `/states/all` every 10 min. icao24-filtered calls cost **4** states-credits each (not serial-only 1). Fleet is chunked by 80 hexes, so ~331 hexes = 5 calls ≈ **20** credits/poll. Record `seen_airborne` for today UTC (collect does not use this as an allow-list or resume signal). Reloads the mapping fleet each poll. Enable by hand for a “who is up” poll. |
 | **Collect** | `adsb-trip-journal-collect.timer` | Daily **06:00 UTC** + up to 15 min jitter. Twelve `GET /flights/all` slices for yesterday UTC, then leftover flights credits walk **newest-first** over never-started or incomplete days (no 90-day floor). A never-started historical day starts only when remaining ≥ **360**; incomplete days resume. Filter to the mapped fleet; persist fleet-filtered JSON. Day complete only after 12/12. Host cap `OPENSKY_MAX_FLIGHTS_CREDITS` **3600** (~10 UTC days/run, ~400 slack). CLI/laptop default **800**. `install.sh` does not overwrite an existing env file. |
 
+### Freshness
+
+`/flights/all` is OpenSky’s **nightly UTC batch**, not a live feed ([FAQ](https://opensky-network.org/about/faq)). There are no completed flights for **today**; polling more often does not land same-day origin/destination in the journal. The 06:00 UTC timer waits on that batch, not on our poll interval. Host journald (2026-09-05–10): 06:00 UTC yesterday slices are thousands of FlightObjects (~1–4 MB); leave the single timer there. A 03:28 UTC fetch of 2026-09-09 slices 0–6 had ~1.5k legs vs ~4–6k at 06:00 — do not collect yesterday before the timer to “get it sooner” (that can 12/12-lock a thinner batch). Do not add a second timer or a readiness probe. Watch `/states/all` is live (who is up now) and does not insert trips.
+
 404 on `/flights/all` for a 2h global window is rare (empty interval). 429 does not mark remaining slices complete. Registrant is not operator. Coverage is thinner than ADS-B Exchange (no MLAT).
 
-Do **not** run `probe --opensky --flights-all` or extra `collect --hex` on the production host without a reason (those spend the flights bucket). `probe --opensky --flights-all` is a one-shot measurement (one 2h slice). Do not call `/flights/aircraft`.
+Do **not** run `probe --opensky --flights-all` or extra `collect --hex` on the production host without a reason (those spend the flights bucket). `probe --opensky --flights-all` is a one-shot measurement (one 2h slice). Do not call `/flights/aircraft`. Do not collect **today**.
 
 ## Deploy (systemd)
 
@@ -128,7 +132,7 @@ Leave the collector running so `_outbox` drains. Do not `--drop-cache` unless th
 4. Leave `trips.sqlite` in place. Re-run: `sudo systemctl start adsb-trip-journal-collect.service`.
 5. `sudo -u adsb /opt/adsb-trip-journal/scripts/run-status.sh` — yesterday UTC should reach 12/12 slices unless the credit cap stopped the walk-back.
 
-Manual collect:
+Manual collect (recovery only — not to beat the 06:00 batch wait):
 
 ```bash
 sudo systemctl start adsb-trip-journal-collect.service
