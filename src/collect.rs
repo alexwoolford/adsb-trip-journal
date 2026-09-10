@@ -18,9 +18,9 @@ use tracing::{info, warn};
 use crate::airports::AirportIndex;
 use crate::fleet::{self, FleetQuery, FleetRow};
 use crate::opensky::{
-    estimated_states_credits, filter_flights_to_fleet, flight_to_trip, states_request_count,
-    utc_day_two_hour_slices, Flight, OpenskyClient, OpenskyOutcome, TrackEnds,
-    FLIGHTS_ALL_LOOKBACK_DAYS, FLIGHTS_ALL_SLICES_PER_DAY, FLIGHTS_ALL_SLICE_CREDITS,
+    estimated_states_credits, filter_flights_to_fleet, flight_needs_track, flight_to_trip,
+    states_request_count, utc_day_two_hour_slices, Flight, OpenskyClient, OpenskyOutcome,
+    TrackEnds, FLIGHTS_ALL_DAY_CREDITS, FLIGHTS_ALL_SLICES_PER_DAY, FLIGHTS_ALL_SLICE_CREDITS,
 };
 use crate::store::{utc_iso, JournalDb, TripSource};
 
@@ -72,6 +72,30 @@ pub fn flights_all_tracks_cache_path(cache_dir: &Path, date: NaiveDate, slice_id
         .join("flights_all")
         .join(date.to_string())
         .join(format!("{slice_idx:02}.tracks.json.gz"))
+}
+
+/// Remove `/flights/all` slice and tracks gzips for `from..=to`. Missing files are skipped.
+pub fn remove_flights_all_caches(cache_dir: &Path, from: NaiveDate, to: NaiveDate) -> Result<u64> {
+    let dates = crate::store::utc_dates_inclusive(from, to)?;
+    let mut removed = 0u64;
+    for date in dates {
+        for slice_idx in 0..FLIGHTS_ALL_SLICES_PER_DAY {
+            for path in [
+                flights_all_slice_cache_path(cache_dir, date, slice_idx),
+                flights_all_tracks_cache_path(cache_dir, date, slice_idx),
+            ] {
+                if path.exists() {
+                    fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+                    removed += 1;
+                }
+            }
+        }
+        let day_dir = cache_dir.join("flights_all").join(date.to_string());
+        if day_dir.is_dir() {
+            let _ = fs::remove_dir(&day_dir);
+        }
+    }
+    Ok(removed)
 }
 
 fn track_attempt_key(icao24: &str, first_seen: i64) -> String {
@@ -188,6 +212,43 @@ pub async fn collect(opts: CollectOptions) -> Result<CollectReport> {
     };
 
     collect_opensky(opts, fleet, db, airports).await
+}
+
+fn remaining_flights_credits(report: &CollectReport, cap: u32) -> u32 {
+    cap.saturating_sub(report.estimated_flights_credits)
+}
+
+fn uncached_incomplete_slice_count(
+    cache_dir: &Path,
+    date: NaiveDate,
+    db: &JournalDb,
+) -> Result<u32> {
+    let mut n = 0u32;
+    for i in 0..FLIGHTS_ALL_SLICES_PER_DAY {
+        if db.flights_all_slice_complete(date, i)? {
+            continue;
+        }
+        if flights_all_slice_cache_path(cache_dir, date, i).exists() {
+            continue;
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Never-started historical days need a full-day flights budget (360) before
+/// we GET. Yesterday (newest) always starts. Incomplete days always resume.
+/// All-cached never-started days cost 0 and still run.
+fn skip_unaffordable_never_started(
+    is_newest: bool,
+    slices_done: u32,
+    remaining_credits: u32,
+    uncached_slices: u32,
+) -> bool {
+    if is_newest || slices_done > 0 || uncached_slices == 0 {
+        return false;
+    }
+    remaining_credits < FLIGHTS_ALL_DAY_CREDITS
 }
 
 pub async fn watch_opensky(
@@ -356,7 +417,18 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
     let yesterday = default_today_utc()
         .pred_opt()
         .unwrap_or_else(default_today_utc);
-    let end = opts.to.unwrap_or(yesterday).min(yesterday);
+    let newest = opts.to.unwrap_or(yesterday).min(yesterday);
+    let oldest = opts.from;
+    if let Some(from) = oldest {
+        if from > newest {
+            info!(
+                %from,
+                %newest,
+                "opensky collect: nothing to do (--from after yesterday/--to)"
+            );
+            return Ok(report);
+        }
+    }
     let by_hex: HashMap<String, FleetRow> = fleet
         .rows
         .iter()
@@ -373,37 +445,42 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
     let mark_complete = ingest_hexes == cache_hexes;
     let fetched_at = utc_iso(Utc::now());
 
-    let mut date = match opts.from {
-        Some(d) => d,
-        None => db.default_opensky_collect_from(
-            yesterday,
-            FLIGHTS_ALL_SLICES_PER_DAY,
-            FLIGHTS_ALL_LOOKBACK_DAYS,
-        )?,
-    };
-    if date > end {
-        info!(%date, %end, "opensky collect: nothing to do (default window is yesterday UTC)");
-        return Ok(report);
-    }
-
     info!(
-        %date,
-        %end,
+        %newest,
+        oldest = oldest.map(|d| d.to_string()).unwrap_or_else(|| "unbounded".into()),
         slices = FLIGHTS_ALL_SLICES_PER_DAY,
         cache_fleet = cache_hexes.len(),
         ingest = ingest_hexes.len(),
-        "opensky collect via /flights/all (not gated on seen_airborne)"
+        cap = opts.max_flights_credits,
+        "opensky collect via /flights/all newest-first (not gated on seen_airborne)"
     );
 
-    while date <= end {
+    let mut date = newest;
+    loop {
         if db.flights_all_day_complete(date, FLIGHTS_ALL_SLICES_PER_DAY)? {
             info!(%date, "flights/all day already complete");
-            date = match date.succ_opt() {
-                Some(n) => n,
-                None => break,
-            };
-            continue;
+            match date.pred_opt() {
+                Some(prev) if oldest.map(|f| prev >= f).unwrap_or(true) => {
+                    date = prev;
+                    continue;
+                }
+                _ => break,
+            }
         }
+
+        let slices_done = db.flights_all_slices_done(date)?;
+        let uncached = uncached_incomplete_slice_count(&opts.cache_dir, date, &db)?;
+        let remaining = remaining_flights_credits(&report, opts.max_flights_credits);
+        if skip_unaffordable_never_started(date == newest, slices_done, remaining, uncached) {
+            info!(
+                %date,
+                remaining,
+                need = FLIGHTS_ALL_DAY_CREDITS,
+                "leftover flights credits cannot buy a whole never-started UTC day"
+            );
+            break;
+        }
+
         let slices = utc_day_two_hour_slices(date);
         let mut halted = false;
         for (slice_idx, (begin, end_ts)) in slices.into_iter().enumerate() {
@@ -513,10 +590,10 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
             report.days_ok += 1;
             info!(%date, "flights/all day complete");
         }
-        date = match date.succ_opt() {
-            Some(n) => n,
-            None => break,
-        };
+        match date.pred_opt() {
+            Some(prev) if oldest.map(|f| prev >= f).unwrap_or(true) => date = prev,
+            _ => break,
+        }
     }
     Ok(report)
 }
@@ -550,16 +627,7 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
         let data = collapse_near_duplicate_flights(&legs);
         let mut tracks = HashMap::new();
         for f in &data {
-            let can_place = f
-                .est_departure_airport
-                .as_deref()
-                .and_then(|id| airports.by_ident(id))
-                .is_some()
-                || f.est_arrival_airport
-                    .as_deref()
-                    .and_then(|id| airports.by_ident(id))
-                    .is_some();
-            if !can_place && tracks_fallback {
+            if flight_needs_track(f, airports) && tracks_fallback {
                 let key = track_attempt_key(&hex, f.first_seen);
                 if let Some(cached) = tracks_cache.get(&key) {
                     if let Some(ends) = cached {
@@ -658,6 +726,27 @@ mod tests {
     }
 
     #[test]
+    fn remove_flights_all_caches_deletes_slice_and_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let date = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let slice = flights_all_slice_cache_path(&cache, date, 0);
+        let tracks = flights_all_tracks_cache_path(&cache, date, 0);
+        fs::create_dir_all(slice.parent().unwrap()).unwrap();
+        fs::write(&slice, b"x").unwrap();
+        fs::write(&tracks, b"y").unwrap();
+        let other =
+            flights_all_slice_cache_path(&cache, NaiveDate::from_ymd_opt(2026, 9, 4).unwrap(), 0);
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, b"z").unwrap();
+        let n = remove_flights_all_caches(&cache, date, date).unwrap();
+        assert_eq!(n, 2);
+        assert!(!slice.exists());
+        assert!(!tracks.exists());
+        assert!(other.exists());
+    }
+
+    #[test]
     fn opensky_hex_sets_cache_is_full_fleet() {
         let fleet = ["abcdef".into(), "ffffff".into()].into_iter().collect();
         let (cache, ingest) = opensky_hex_sets(&fleet, &[]).unwrap();
@@ -713,6 +802,24 @@ mod tests {
     }
 
     #[test]
+    fn skip_unaffordable_never_started_day() {
+        assert!(
+            !skip_unaffordable_never_started(true, 0, 0, 12),
+            "newest day always starts"
+        );
+        assert!(
+            !skip_unaffordable_never_started(false, 1, 30, 11),
+            "incomplete days resume below a full-day budget"
+        );
+        assert!(
+            !skip_unaffordable_never_started(false, 0, 0, 0),
+            "all-cached never-started days cost 0"
+        );
+        assert!(skip_unaffordable_never_started(false, 0, 359, 12));
+        assert!(!skip_unaffordable_never_started(false, 0, 360, 12));
+    }
+
+    #[test]
     fn collapse_prefers_callsign_when_airports_tie() {
         let flights = crate::opensky::parse_flights(
             br#"[
@@ -756,15 +863,35 @@ mod tests {
         hex_filter: Vec<String>,
         tracks_fallback: bool,
     ) -> CollectOptions {
+        collect_opts_range(
+            cache,
+            journal,
+            date,
+            date,
+            DEFAULT_MAX_FLIGHTS_CREDITS,
+            hex_filter,
+            tracks_fallback,
+        )
+    }
+
+    fn collect_opts_range(
+        cache: &Path,
+        journal: &Path,
+        from: NaiveDate,
+        to: NaiveDate,
+        max_flights_credits: u32,
+        hex_filter: Vec<String>,
+        tracks_fallback: bool,
+    ) -> CollectOptions {
         CollectOptions {
             mapping_sqlite: journal.to_path_buf(),
             journal_sqlite: journal.to_path_buf(),
             cache_dir: cache.to_path_buf(),
             airports_csv: None,
-            from: Some(date),
-            to: Some(date),
+            from: Some(from),
+            to: Some(to),
             opensky: None,
-            max_flights_credits: DEFAULT_MAX_FLIGHTS_CREDITS,
+            max_flights_credits,
             tracks_fallback,
             hex_filter,
         }
@@ -1118,5 +1245,93 @@ mod tests {
             "{:?}",
             st.flights_all_errors
         );
+    }
+
+    #[tokio::test]
+    async fn collect_newest_first_does_not_start_unaffordable_older_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let journal = dir.path().join("trips.sqlite");
+        let older = NaiveDate::from_ymd_opt(2024, 1, 14).unwrap();
+        let newer = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let mut db = JournalDb::open(&journal).unwrap();
+        let fleet = crate::fleet::FleetQuery {
+            rows: vec![fleet_row("abcdef")],
+            skipped_empty_icao24: 0,
+            snapshot_as_of: "2026-08-31".into(),
+        };
+        db.replace_fleet_snapshot(&fleet.rows, &fleet.snapshot_as_of)
+            .unwrap();
+        let fake = FakeOpensky {
+            flights_payload: Vec::new(),
+            flights_http: std::sync::atomic::AtomicU32::new(0),
+            fail_on_flights_http: None,
+            tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            tracks_http: std::sync::atomic::AtomicU32::new(0),
+        };
+        let opts = collect_opts_range(
+            &cache,
+            &journal,
+            older,
+            newer,
+            FLIGHTS_ALL_DAY_CREDITS,
+            Vec::new(),
+            false,
+        );
+        let r = collect_opensky_with(&fake, &opts, fleet, db, test_airports())
+            .await
+            .unwrap();
+        assert_eq!(r.flights_calls, 12, "only the newest never-started day");
+        assert_eq!(r.estimated_flights_credits, FLIGHTS_ALL_DAY_CREDITS);
+        let db = JournalDb::open(&journal).unwrap();
+        assert!(db.flights_all_day_complete(newer, 12).unwrap());
+        assert_eq!(db.flights_all_slices_done(older).unwrap(), 0);
+        assert!(!db.flights_all_day_complete(older, 12).unwrap());
+    }
+
+    #[tokio::test]
+    async fn collect_resumes_incomplete_day_below_full_day_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let journal = dir.path().join("trips.sqlite");
+        let older = NaiveDate::from_ymd_opt(2024, 1, 14).unwrap();
+        let newer = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let mut db = JournalDb::open(&journal).unwrap();
+        let fleet = crate::fleet::FleetQuery {
+            rows: vec![fleet_row("abcdef")],
+            skipped_empty_icao24: 0,
+            snapshot_as_of: "2026-08-31".into(),
+        };
+        db.replace_fleet_snapshot(&fleet.rows, &fleet.snapshot_as_of)
+            .unwrap();
+        for i in 0..12 {
+            db.mark_flights_all_slice_ok(newer, i).unwrap();
+        }
+        for i in 0..11 {
+            db.mark_flights_all_slice_ok(older, i).unwrap();
+        }
+        let fake = FakeOpensky {
+            flights_payload: Vec::new(),
+            flights_http: std::sync::atomic::AtomicU32::new(0),
+            fail_on_flights_http: None,
+            tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            tracks_http: std::sync::atomic::AtomicU32::new(0),
+        };
+        let opts = collect_opts_range(
+            &cache,
+            &journal,
+            older,
+            newer,
+            FLIGHTS_ALL_SLICE_CREDITS,
+            Vec::new(),
+            false,
+        );
+        let r = collect_opensky_with(&fake, &opts, fleet, db, test_airports())
+            .await
+            .unwrap();
+        assert_eq!(r.flights_calls, 1);
+        assert_eq!(r.estimated_flights_credits, FLIGHTS_ALL_SLICE_CREDITS);
+        let db = JournalDb::open(&journal).unwrap();
+        assert!(db.flights_all_day_complete(older, 12).unwrap());
     }
 }

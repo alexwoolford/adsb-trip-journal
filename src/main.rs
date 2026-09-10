@@ -11,11 +11,12 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use adsb_trip_journal::collect::{
-    collect, default_today_utc, print_status, watch_opensky, CollectOptions, CollectReport,
+    collect, default_today_utc, print_status, remove_flights_all_caches, watch_opensky,
+    CollectOptions, CollectReport,
 };
 use adsb_trip_journal::fleet::{self, query_fleet};
 use adsb_trip_journal::opensky::{OpenskyClient, OpenskyConfig, DEFAULT_MAX_FLIGHTS_CREDITS};
-use adsb_trip_journal::store::JournalDb;
+use adsb_trip_journal::store::{utc_dates_inclusive, InvalidateReport, JournalDb};
 
 const OUR_AIRPORTS_URL: &str = "https://davidmegginson.github.io/ourairports-data/airports.csv";
 
@@ -63,14 +64,16 @@ enum Commands {
     },
     /// Snapshot the fleet and collect OpenSky /flights/all slices.
     Collect {
+        /// Oldest UTC date (inclusive). Omit to walk newest-first with no floor.
         #[arg(long)]
         from: Option<String>,
+        /// Newest UTC date (inclusive). Defaults to yesterday UTC.
         #[arg(long)]
         to: Option<String>,
         /// Cap OpenSky `/flights/all` spend (12 slices/day; historical slices billed 30 on this account).
         #[arg(long, default_value_t = DEFAULT_MAX_FLIGHTS_CREDITS)]
         max_flights_credits: u32,
-        /// Skip /tracks when both OpenSky airport estimates are missing.
+        /// Skip /tracks (trusted OpenSky idents only; far-horiz and missing ends are dropped).
         #[arg(long, default_value_t = false)]
         no_tracks_fallback: bool,
         /// Restrict OpenSky ingest to these hexes (repeatable). Slice cache is still the full mapped fleet; a `--hex` run does not mark the UTC day complete.
@@ -86,6 +89,27 @@ enum Commands {
     },
     /// Print journal coverage.
     Status,
+    /// Unlock UTC days so the next collect walk-back replays cache (or re-GETs).
+    /// 12/12 never auto-invalidates on a binary upgrade.
+    Invalidate {
+        /// First UTC date (inclusive).
+        #[arg(long)]
+        from: String,
+        /// Last UTC date (inclusive). Defaults to `--from`.
+        #[arg(long)]
+        to: Option<String>,
+        /// Delete gzip slice caches so the next collect re-GETs (360 flights-credits/UTC day).
+        /// Default is keep-cache: replay FlightObjects without spending.
+        #[arg(long)]
+        drop_cache: bool,
+    },
+    /// Delete the unit-test fixture trip and UTC days that never stored callsign/quality ints.
+    /// Dry-run unless `--apply`. Does not unlock 12/12 (no re-GET).
+    Gc {
+        /// Perform deletes. Without this flag, print counts only.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[tokio::main]
@@ -146,6 +170,16 @@ async fn main() -> Result<()> {
         }
         Commands::Status => {
             cmd_status(cli.mapping_sqlite.as_deref(), &journal)?;
+        }
+        Commands::Invalidate {
+            from,
+            to,
+            drop_cache,
+        } => {
+            cmd_invalidate(&journal, &cli.cache_dir, from, to.as_deref(), *drop_cache)?;
+        }
+        Commands::Gc { apply } => {
+            cmd_gc(&journal, *apply)?;
         }
     }
     Ok(())
@@ -343,6 +377,81 @@ fn cmd_status(mapping: Option<&Path>, journal: &Path) -> Result<()> {
         None
     };
     print_status(&status, fleet.as_ref());
+    Ok(())
+}
+
+fn cmd_invalidate(
+    journal: &Path,
+    cache_dir: &Path,
+    from: &str,
+    to: Option<&str>,
+    drop_cache: bool,
+) -> Result<()> {
+    if !journal.exists() {
+        anyhow::bail!("no journal at {}", journal.display());
+    }
+    let from =
+        NaiveDate::parse_from_str(from, "%Y-%m-%d").with_context(|| format!("--from {from}"))?;
+    let to = match to {
+        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").with_context(|| format!("--to {s}"))?,
+        None => from,
+    };
+    let _days = utc_dates_inclusive(from, to)?;
+    let db = JournalDb::open(journal)?;
+    let (slices_deleted, day_rows_deleted) = db.invalidate_flights_all_range(from, to)?;
+    let cache_files_removed = if drop_cache {
+        remove_flights_all_caches(cache_dir, from, to)?
+    } else {
+        0
+    };
+    let report = InvalidateReport {
+        from: from.to_string(),
+        to: to.to_string(),
+        slices_deleted,
+        day_rows_deleted,
+        cache_files_removed,
+        drop_cache,
+    };
+    println!(
+        "invalidate from={} to={} drop_cache={} slices_deleted={} day_rows_deleted={} cache_files_removed={}",
+        report.from,
+        report.to,
+        report.drop_cache,
+        report.slices_deleted,
+        report.day_rows_deleted,
+        report.cache_files_removed
+    );
+    if drop_cache {
+        println!("next collect will GET /flights/all for that range (360 flights-credits/UTC day)");
+    } else {
+        println!(
+            "gzip caches kept; next collect walk-back replays FlightObjects (no flights credits)"
+        );
+    }
+    Ok(())
+}
+
+fn cmd_gc(journal: &Path, apply: bool) -> Result<()> {
+    if !journal.exists() {
+        anyhow::bail!("no journal at {}", journal.display());
+    }
+    let db = JournalDb::open(journal)?;
+    let report = if apply {
+        db.apply_gc()?
+    } else {
+        db.preview_gc()?
+    };
+    println!(
+        "gc dry_run={} fixture_trips={} payloadless_days={} payloadless_trips={} trips_deleted={}",
+        report.dry_run,
+        report.fixture_trips,
+        report.payloadless_days.join(","),
+        report.payloadless_trips,
+        report.trips_deleted
+    );
+    if report.dry_run {
+        println!("re-run with --apply to delete; flights_all 12/12 is left in place (no re-GET)");
+    }
     Ok(())
 }
 

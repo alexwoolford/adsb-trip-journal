@@ -8,6 +8,15 @@ use anyhow::{Context, Result};
 
 pub const SNAP_RADIUS_KM: f64 = 8.0;
 
+/// OpenSky `est*AirportHorizDistance` is usable as a landing ident only inside
+/// [`SNAP_RADIUS_KM`]. `None` means the field was omitted (treat as trusted).
+pub fn estimate_horiz_ok(horiz_m: Option<i64>) -> bool {
+    match horiz_m {
+        Some(h) => (h as f64) <= SNAP_RADIUS_KM * 1000.0,
+        None => true,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AirportType {
     Large = 0,
@@ -236,5 +245,13 @@ FAR,small_airport,0.0,0.0
         let csv = "ident,type,latitude_deg,longitude_deg\nXX,closed_airport,39.57,-104.67\n";
         let i = AirportIndex::from_reader(csv.as_bytes()).unwrap();
         assert!(i.snap(39.57, -104.67).ident.is_none());
+    }
+
+    #[test]
+    fn estimate_horiz_matches_snap_radius() {
+        assert!(estimate_horiz_ok(None));
+        assert!(estimate_horiz_ok(Some(0)));
+        assert!(estimate_horiz_ok(Some(8000)));
+        assert!(!estimate_horiz_ok(Some(8001)));
     }
 }
