@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use adsb_trip_journal::collect::{
@@ -456,29 +457,29 @@ fn cmd_gc(journal: &Path, apply: bool) -> Result<()> {
 }
 
 fn print_report(r: &CollectReport) {
-    println!(
-        "collect fleet_hexes={} skipped_empty_icao24={} days_ok={} days_404={} from_cache={} trips_upserted={} stopped_hexes={} live_polls={} live_trips={}",
-        r.fleet_hexes,
-        r.skipped_empty_icao24,
-        r.days_ok,
-        r.days_not_found,
-        r.days_from_cache,
-        r.trips_upserted,
-        r.hexes_stopped_on_error,
-        r.live_polls,
-        r.live_trips
+    info!(
+        fleet_hexes = r.fleet_hexes,
+        skipped_empty_icao24 = r.skipped_empty_icao24,
+        days_ok = r.days_ok,
+        days_404 = r.days_not_found,
+        from_cache = r.days_from_cache,
+        trips_upserted = r.trips_upserted,
+        stopped_hexes = r.hexes_stopped_on_error,
+        live_polls = r.live_polls,
+        live_trips = r.live_trips,
+        "collect report"
     );
     if r.flights_calls > 0
         || r.tracks_calls > 0
         || r.estimated_flights_credits > 0
         || r.skipped_no_coords > 0
     {
-        println!(
-            "  opensky flights_calls={} tracks_calls={} skipped_no_coords={} estimated_flights_credits={}",
-            r.flights_calls,
-            r.tracks_calls,
-            r.skipped_no_coords,
-            r.estimated_flights_credits
+        info!(
+            flights_calls = r.flights_calls,
+            tracks_calls = r.tracks_calls,
+            skipped_no_coords = r.skipped_no_coords,
+            estimated_flights_credits = r.estimated_flights_credits,
+            "opensky credit spend"
         );
     }
 }

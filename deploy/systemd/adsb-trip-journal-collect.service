@@ -9,6 +9,7 @@ Type=oneshot
 User=adsb
 Group=adsb
 Nice=10
+Environment=RUST_LOG=info
 EnvironmentFile=-/opt/adsb-trip-journal/etc/adsb-trip-journal.env
 WorkingDirectory=/opt/adsb-trip-journal
 ExecStart=/opt/adsb-trip-journal/scripts/run-collect.sh

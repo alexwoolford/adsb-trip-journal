@@ -163,7 +163,7 @@ TAIL_TO_TICKER_SQLITE=/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite
 
 ## State capture (prep)
 
-Logical name: `adsb-trip-journal`. Watch the writable journal, not a copy.
+Contract: [`CAPTURE.md`](CAPTURE.md). Logical name: `adsb-trip-journal`. Watch the writable journal, not a copy.
 
 | Path | Role |
 |---|---|

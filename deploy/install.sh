@@ -63,6 +63,9 @@ NLOGIN="/usr/sbin/nologin"
 if ! id -u "$USER_NAME" >/dev/null 2>&1; then
   useradd --system --home-dir "$STATE" --shell "$NLOGIN" "$USER_NAME" || true
 fi
+if getent group state-capture >/dev/null 2>&1; then
+  usermod -aG state-capture "$USER_NAME" || true
+fi
 mkdir -p "$PREFIX"/{bin,scripts,etc,docs} \
   "$STATE"/mapping \
   "$STATE"/cache \
@@ -76,6 +79,7 @@ install -m 0755 "$ROOT/scripts/run-status.sh" "$PREFIX/scripts/run-status.sh"
 install -m 0755 "$ROOT/scripts/run-gc.sh" "$PREFIX/scripts/run-gc.sh"
 install -m 0755 "$ROOT/scripts/run-invalidate.sh" "$PREFIX/scripts/run-invalidate.sh"
 install -m 0644 "$ROOT/docs/DAILY_OPS.md" "$PREFIX/docs/DAILY_OPS.md"
+install -m 0644 "$ROOT/docs/CAPTURE.md" "$PREFIX/docs/CAPTURE.md"
 
 if [[ ! -f "$ENV_DST" ]]; then
   if [[ -n "${ADSB_ENV_FILE:-}" && -f "$ADSB_ENV_FILE" ]]; then
@@ -162,14 +166,14 @@ if [[ ! -f "$AIRPORTS_DST" ]]; then
 fi
 
 if [[ "$creds_set" -eq 1 ]]; then
-  systemctl enable --now adsb-trip-journal-collect.timer
-  echo "  timer: adsb-trip-journal-collect.timer enabled (daily 06:00 UTC + 15m jitter)"
+  systemctl enable adsb-trip-journal-collect.timer
+  echo "  timer: adsb-trip-journal-collect.timer enabled (daily 06:00 UTC + 15m jitter; not started now)"
   echo "  watch: installed, not enabled (collect does not read seen_airborne)"
   echo "    sudo systemctl enable --now adsb-trip-journal-watch.service"
 else
   echo "  OPENSKY_CLIENT_SECRET is empty — timer not enabled."
   echo "  Fill credentials in $ENV_DST, then:"
-  echo "    sudo systemctl enable --now adsb-trip-journal-collect.timer"
+  echo "    sudo systemctl enable adsb-trip-journal-collect.timer"
   echo "  Optional diagnostic:"
   echo "    sudo systemctl enable --now adsb-trip-journal-watch.service"
 fi
