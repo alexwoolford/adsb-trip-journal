@@ -93,6 +93,8 @@ journalctl -u adsb-trip-journal-collect.service -n 50 --no-pager
 sudo -u adsb /opt/adsb-trip-journal/scripts/run-status.sh
 ```
 
+`status` names 12/12 dates with zero trips as empty-locked (credit lock with no hops). Incomplete days still print `n/12`. Do not treat a low trip count on a 12/12 day as empty-locked.
+
 Production journal is **only** `/var/lib/adsb-trip-journal/trips.sqlite`. Do not rsync a laptop `data/trips.sqlite` onto the host (unit-test fixture `abcdef` / `N1` leaked that way once).
 
 ## Schema change after 12/12 (invalidate / gc)
@@ -110,7 +112,7 @@ sudo -u adsb /opt/adsb-trip-journal/scripts/run-gc.sh
 sudo -u adsb /opt/adsb-trip-journal/scripts/run-gc.sh --apply
 ```
 
-Those days stay 12/12. Mosaic follows via `_outbox` `D` after drain. Do not add a silent ingest-schema bump that spends the flights bucket.
+Those days stay 12/12. `status` lists them as empty-locked so an operator can `invalidate` (keep-cache if the gzip still has FlightObjects). Mosaic follows via `_outbox` `D` after drain. Do not add a silent ingest-schema bump that spends the flights bucket.
 
 Each `trips` row is one hop. A same-day Tulsa→Houston→Tulsa day is two rows. OpenSky airport labels farther than 8 km are not landings: collect spends **tracks** credits (4 each, 4,000/day bucket) to snap `/tracks` endpoints. Re-GET `/flights/all` (`invalidate --drop-cache`) returns the same FlightObjects and does **not** fix bad idents.
 
