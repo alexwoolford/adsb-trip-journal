@@ -40,6 +40,10 @@ pub const FLIGHTS_ALL_SLICE_SECS: i64 = 7_200;
 /// (2026-09-03 12:00–14:00 UTC; HTTP 200, remaining consistent with 30 after
 /// that day's `/flights/aircraft` collect). Docs' "Live / < 24 h → 4" does not apply.
 pub const FLIGHTS_ALL_SLICE_CREDITS: u32 = 30;
+/// Raw global `/flights/all` count below this (and non-zero) is treated as a
+/// truncated overnight batch: do not cache, do not mark the slice complete.
+/// Healthy slice 0 on this account is ~4–6k FlightObjects.
+pub const FLIGHTS_ALL_MIN_SLICE_N: usize = 2_000;
 const STATES_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const FLIGHTS_ALL_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
 /// Twelve historical slices at [`FLIGHTS_ALL_SLICE_CREDITS`] (360). Leftover
@@ -1048,6 +1052,7 @@ mod tests {
     fn historical_flights_call_is_thirty_credits() {
         assert_eq!(FLIGHTS_CALL_CREDITS, 30);
         assert_eq!(FLIGHTS_ALL_SLICE_CREDITS, 30);
+        assert_eq!(FLIGHTS_ALL_MIN_SLICE_N, 2_000);
         assert_eq!(DEFAULT_MAX_FLIGHTS_CREDITS, 800);
         assert_eq!(FLIGHTS_ALL_DAY_CREDITS, 360);
     }

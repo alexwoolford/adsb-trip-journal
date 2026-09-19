@@ -16,7 +16,9 @@ use adsb_trip_journal::collect::{
     CollectOptions, CollectReport,
 };
 use adsb_trip_journal::fleet::{self, query_fleet};
-use adsb_trip_journal::opensky::{OpenskyClient, OpenskyConfig, DEFAULT_MAX_FLIGHTS_CREDITS};
+use adsb_trip_journal::opensky::{
+    OpenskyClient, OpenskyConfig, DEFAULT_MAX_FLIGHTS_CREDITS, FLIGHTS_ALL_MIN_SLICE_N,
+};
 use adsb_trip_journal::store::{utc_dates_inclusive, InvalidateReport, JournalDb};
 
 const OUR_AIRPORTS_URL: &str = "https://davidmegginson.github.io/ourairports-data/airports.csv";
@@ -220,6 +222,7 @@ async fn cmd_collect(
         max_flights_credits,
         tracks_fallback,
         hex_filter: hexes,
+        min_flights_all_slice_n: FLIGHTS_ALL_MIN_SLICE_N,
     };
     let report = collect(opts).await?;
     print_report(&report);

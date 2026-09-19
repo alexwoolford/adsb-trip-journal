@@ -25,7 +25,11 @@ Operator logs: `tracing` on stderr → journald (`SyslogIdentifier` matches the 
 
 ### Freshness
 
-`/flights/all` is OpenSky’s **nightly UTC batch**, not a live feed ([FAQ](https://opensky-network.org/about/faq)). There are no completed flights for **today**; polling more often does not land same-day origin/destination in the journal. The 06:00 UTC timer waits on that batch, not on our poll interval. Host journald (2026-09-05–10): 06:00 UTC yesterday slices are thousands of FlightObjects (~1–4 MB); leave the single timer there. A 03:28 UTC fetch of 2026-09-09 slices 0–6 had ~1.5k legs vs ~4–6k at 06:00 — do not collect yesterday before the timer to “get it sooner” (that can 12/12-lock a thinner batch). Do not add a second timer or a readiness probe. Watch `/states/all` is live (who is up now) and does not insert trips.
+`/flights/all` is OpenSky’s **nightly UTC batch**, not a live feed ([FAQ](https://opensky-network.org/about/faq)). There are no completed flights for **today**; polling more often does not land same-day origin/destination in the journal. The 06:00 UTC timer waits on that batch, not on our poll interval. Host journald (2026-09-05–10): 06:00 UTC yesterday slices are thousands of FlightObjects (~1–4 MB); leave the single timer there. A 03:28 UTC fetch of 2026-09-09 slices 0–6 had ~1.5k legs vs ~4–6k at 06:00 — do not collect yesterday before the timer to “get it sooner”.
+
+A 200 with raw `n` in `(0, 2000)` is treated as a **truncated batch**: no gzip, slice not marked complete, next timer re-GETs. Do not 12/12-lock a thin day. `/tracks` 429/5xx skip that hex (and 429 skips further tracks for the run) but **do not abort** remaining `/flights/all` slices; the failing slice stays unmarked so gzip replay can retry tracks. Do not add a second timer or a readiness probe. Watch `/states/all` is live (who is up now) and does not insert trips.
+
+Days **2026-09-16** and **2026-09-18** were locked thin/incomplete before this rule (empty fleet gzips). Repair on the host only, after this binary is deployed: `invalidate --drop-cache` those dates, then `run-collect.sh --from 2026-09-16 --to 2026-09-18`. Do not collect **today**. Do not probe from the laptop.
 
 404 on `/flights/all` for a 2h global window is rare (empty interval). 429 does not mark remaining slices complete. Registrant is not operator. Coverage is thinner than ADS-B Exchange (no MLAT).
 
@@ -127,7 +131,7 @@ Leave the collector running so `_outbox` drains. Do not `--drop-cache` unless th
 `Persistent=true` will retry after a reboot. It will not page you.
 
 1. `systemctl is-failed adsb-trip-journal-collect.service` and `systemctl list-timers 'adsb-trip-journal-*'`.
-2. `journalctl -u adsb-trip-journal-collect.service -n 80 --no-pager`. 401/403 on OpenSky is credentials. Missing mapping sqlite is `TAIL_TO_TICKER_SQLITE`. 429 should resume from slice cache.
+2. `journalctl -u adsb-trip-journal-collect.service -n 80 --no-pager`. 401/403 on OpenSky is credentials. Missing mapping sqlite is `TAIL_TO_TICKER_SQLITE`. `/flights/all` 429 still stops the run (resume from slice cache). `/tracks` 429/5xx leave that slice unmarked and continue later slices. `flights/all thin n=` means the overnight batch was incomplete; the slice is not cached.
 3. Confirm host env `OPENSKY_MAX_FLIGHTS_CREDITS=3600` (wrapper default is 800 if unset). `install.sh` does not overwrite an existing env file.
 4. Leave `trips.sqlite` in place. Re-run: `sudo systemctl start adsb-trip-journal-collect.service`.
 5. `sudo -u adsb /opt/adsb-trip-journal/scripts/run-status.sh` — yesterday UTC should reach 12/12 slices unless the credit cap stopped the walk-back.
@@ -152,7 +156,7 @@ TAIL_TO_TICKER_SQLITE=/var/lib/tail-to-ticker/current/tail_to_ticker.sqlite
 
 - Watch: ~**20** states-credits/poll × 144 ≈ **2,880**/day of the 4,000 **states** bucket (icao24 filter is 4/call × 5 chunks for a ~331-hex fleet). Independent of flights. Optional; collect does not spend this.
 - Collect: **12 × `/flights/all`** per UTC day of the **flights** bucket (**30**/slice measured 2026-09-03 = **360**/day). Host cap **3600** (CLI/laptop **800**). After yesterday, leftover credits fill **newer-first** history (whole UTC days). Do not start a never-started historical day unless remaining ≥ **360**; resume incomplete days. Cached slices cost 0. `--hex` does not shrink the cache. Ingest keeps the full FlightObject on mapped rows: `callsign` (label, often null) plus airport-estimate quality integers. Complete days are not re-GET unless an operator runs `invalidate`. Default `invalidate` keeps gzip caches so the next collect **replays** FlightObjects (no credits). `--drop-cache` re-GETs. `gc --apply` deletes fixture / pre-payload days without unlocking 12/12.
-- Tracks fallback when **either** OpenSky airport ident is missing, not in OurAirports, or farther than 8 km (tracks bucket). Successful (and empty) `/tracks` attempts are cached per slice so a 429 resume does not re-call the same `icao24+firstSeen`. Track `callsign` fills the trip only when the FlightObject had none.
+- Tracks fallback when **either** OpenSky airport ident is missing, not in OurAirports, or farther than 8 km (tracks bucket). Successful (and empty) `/tracks` attempts are cached per slice so a 429 resume does not re-call the same `icao24+firstSeen`. Track `callsign` fills the trip only when the FlightObject had none. A tracks 429/5xx does **not** abort remaining `/flights/all` slices.
 
 ## Limits
 

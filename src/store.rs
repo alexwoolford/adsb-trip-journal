@@ -488,16 +488,30 @@ impl JournalDb {
             "#,
             params![date.to_string(), slice_idx, now],
         )?;
-        self.conn.execute(
-            r#"
-            INSERT INTO flights_all_day (utc_date, last_error, updated_at)
-            VALUES (?1, NULL, ?2)
-            ON CONFLICT(utc_date) DO UPDATE SET
-              last_error = NULL,
-              updated_at = excluded.updated_at
-            "#,
-            params![date.to_string(), now],
-        )?;
+        // Later empty slices must not wipe a tracks/thin last_error on the same
+        // UTC day. Clear it only when the day is actually 12/12.
+        if self.flights_all_day_complete(date, 12)? {
+            self.conn.execute(
+                r#"
+                INSERT INTO flights_all_day (utc_date, last_error, updated_at)
+                VALUES (?1, NULL, ?2)
+                ON CONFLICT(utc_date) DO UPDATE SET
+                  last_error = NULL,
+                  updated_at = excluded.updated_at
+                "#,
+                params![date.to_string(), now],
+            )?;
+        } else {
+            self.conn.execute(
+                r#"
+                INSERT INTO flights_all_day (utc_date, last_error, updated_at)
+                VALUES (?1, NULL, ?2)
+                ON CONFLICT(utc_date) DO UPDATE SET
+                  updated_at = excluded.updated_at
+                "#,
+                params![date.to_string(), now],
+            )?;
+        }
         self.nudge.send();
         Ok(())
     }
@@ -1153,6 +1167,31 @@ mod tests {
         assert!(!db.flights_all_day_complete(d, 12).unwrap());
         db.set_flights_all_error(d, "flights/all HTTP 429").unwrap();
         assert!(!db.flights_all_day_complete(d, 12).unwrap());
+    }
+
+    #[test]
+    fn mark_slice_ok_keeps_last_error_until_day_complete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let db = JournalDb::open(&path).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        db.set_flights_all_error(d, "tracks HTTP 500").unwrap();
+        db.mark_flights_all_slice_ok(d, 1).unwrap();
+        assert_eq!(
+            db.status(&path).unwrap().flights_all_errors,
+            vec![("2026-09-03".into(), "tracks HTTP 500".into())]
+        );
+        for i in 2..12 {
+            db.mark_flights_all_slice_ok(d, i).unwrap();
+        }
+        assert!(!db.flights_all_day_complete(d, 12).unwrap());
+        assert_eq!(
+            db.status(&path).unwrap().flights_all_errors,
+            vec![("2026-09-03".into(), "tracks HTTP 500".into())]
+        );
+        db.mark_flights_all_slice_ok(d, 0).unwrap();
+        assert!(db.flights_all_day_complete(d, 12).unwrap());
+        assert!(db.status(&path).unwrap().flights_all_errors.is_empty());
     }
 
     #[test]

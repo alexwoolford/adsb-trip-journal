@@ -37,6 +37,8 @@ pub struct CollectOptions {
     /// When non-empty, ingest only these mapped hexes. Slice cache is still the
     /// full fleet; a `--hex` run does not mark the UTC day complete.
     pub hex_filter: Vec<String>,
+    /// Skip cache+complete when a 200 body's raw `n` is in `(0, min)`. `0` disables.
+    pub min_flights_all_slice_n: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -483,6 +485,7 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
 
         let slices = utc_day_two_hour_slices(date);
         let mut halted = false;
+        let mut tracks_exhausted = false;
         for (slice_idx, (begin, end_ts)) in slices.into_iter().enumerate() {
             let slice_idx = slice_idx as u32;
             if db.flights_all_slice_complete(date, slice_idx)? {
@@ -521,6 +524,19 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
                             remaining = ?credit.remaining,
                             "opensky flights/all"
                         );
+                        if opts.min_flights_all_slice_n > 0
+                            && !data.is_empty()
+                            && data.len() < opts.min_flights_all_slice_n
+                        {
+                            let msg = format!(
+                                "flights/all thin n={} min={}",
+                                data.len(),
+                                opts.min_flights_all_slice_n
+                            );
+                            warn!(%date, slice = slice_idx, %msg);
+                            db.set_flights_all_error(date, &msg)?;
+                            continue;
+                        }
                         let filtered = filter_flights_to_fleet(&data, &cache_hexes);
                         let json = serde_json::to_vec(&filtered)?;
                         write_gzip_cache(&cache_path, &json)?;
@@ -570,17 +586,18 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
                 &fetched_at,
                 &tracks_path,
                 &mut report,
+                &mut tracks_exhausted,
             )
             .await?
             {
-                SliceHalt::Stop(msg) => {
+                SliceHalt::Defer(msg) => {
                     db.set_flights_all_error(date, &msg)?;
-                    return Ok(report);
                 }
-                SliceHalt::Continue => {}
-            }
-            if mark_complete {
-                db.mark_flights_all_slice_ok(date, slice_idx)?;
+                SliceHalt::Continue => {
+                    if mark_complete {
+                        db.mark_flights_all_slice_ok(date, slice_idx)?;
+                    }
+                }
             }
         }
         if halted {
@@ -600,7 +617,7 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
 
 enum SliceHalt {
     Continue,
-    Stop(String),
+    Defer(String),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -614,12 +631,14 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
     fetched_at: &str,
     tracks_cache_path: &Path,
     report: &mut CollectReport,
+    tracks_exhausted: &mut bool,
 ) -> Result<SliceHalt> {
     let mut by_icao: HashMap<String, Vec<Flight>> = HashMap::new();
     for f in flights {
         by_icao.entry(f.icao24.clone()).or_default().push(f.clone());
     }
     let mut tracks_cache = read_tracks_cache(tracks_cache_path)?;
+    let mut defer_msg: Option<String> = None;
     for (hex, legs) in by_icao {
         let Some(row) = by_hex.get(&hex) else {
             continue;
@@ -632,6 +651,12 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
                 if let Some(cached) = tracks_cache.get(&key) {
                     if let Some(ends) = cached {
                         tracks.insert(f.first_seen, ends.clone());
+                    }
+                    continue;
+                }
+                if *tracks_exhausted {
+                    if defer_msg.is_none() {
+                        defer_msg = Some("tracks skipped (bucket exhausted)".into());
                     }
                     continue;
                 }
@@ -653,7 +678,8 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
                         warn!(%hex, %msg);
                         write_tracks_cache(tracks_cache_path, &tracks_cache)?;
                         report.hexes_stopped_on_error += 1;
-                        return Ok(SliceHalt::Stop(msg));
+                        *tracks_exhausted = true;
+                        defer_msg = Some(msg);
                     }
                     OpenskyOutcome::Denied { status, message }
                     | OpenskyOutcome::Other { status, message } => {
@@ -661,7 +687,8 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
                         warn!(%hex, %msg);
                         write_tracks_cache(tracks_cache_path, &tracks_cache)?;
                         report.hexes_stopped_on_error += 1;
-                        return Ok(SliceHalt::Stop(msg));
+                        defer_msg = Some(msg);
+                        break;
                     }
                 }
             }
@@ -670,7 +697,10 @@ async fn ingest_filtered_opensky_slice<C: OpenskyCollectApi>(
         report.trips_upserted += up;
         report.skipped_no_coords += skip;
     }
-    Ok(SliceHalt::Continue)
+    match defer_msg {
+        Some(msg) => Ok(SliceHalt::Defer(msg)),
+        None => Ok(SliceHalt::Continue),
+    }
 }
 
 pub fn print_status(status: &crate::store::JournalStatus, fleet: Option<&FleetQuery>) {
@@ -894,6 +924,7 @@ mod tests {
             max_flights_credits,
             tracks_fallback,
             hex_filter,
+            min_flights_all_slice_n: 0,
         }
     }
 
@@ -1155,7 +1186,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.tracks_calls, 2);
-        assert_eq!(r.flights_calls, 1);
+        assert_eq!(
+            r.flights_calls, 12,
+            "tracks 429 must not abort remaining /flights/all slices"
+        );
         assert!(flights_all_tracks_cache_path(&cache, date, 0).exists());
         let db = JournalDb::open(&journal).unwrap();
         assert!(!db.flights_all_slice_complete(date, 0).unwrap());
@@ -1170,8 +1204,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            r2.flights_calls, 11,
-            "slice 0 from cache; remaining slices HTTP"
+            r2.flights_calls, 0,
+            "slice 0 from cache; later empty slices already complete"
         );
         assert_eq!(r2.days_from_cache, 1);
         assert_eq!(
@@ -1224,12 +1258,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.tracks_calls, 1);
-        assert_eq!(r.flights_calls, 1);
+        assert_eq!(
+            r.flights_calls, 12,
+            "tracks Other must still GET remaining /flights/all slices"
+        );
         assert_eq!(r.hexes_stopped_on_error, 1);
         let db = JournalDb::open(&journal).unwrap();
         assert!(
             !db.flights_all_slice_complete(date, 0).unwrap(),
             "tracks Other must not mark the slice complete"
+        );
+        assert!(
+            db.flights_all_slice_complete(date, 1).unwrap(),
+            "later empty slices without tracks still complete"
         );
         assert!(!db.flights_all_day_complete(date, 12).unwrap());
         assert!(
@@ -1333,5 +1374,52 @@ mod tests {
         assert_eq!(r.estimated_flights_credits, FLIGHTS_ALL_SLICE_CREDITS);
         let db = JournalDb::open(&journal).unwrap();
         assert!(db.flights_all_day_complete(older, 12).unwrap());
+    }
+
+    #[tokio::test]
+    async fn collect_thin_flights_all_does_not_cache_or_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let journal = dir.path().join("trips.sqlite");
+        let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let flights = crate::opensky::parse_flights(
+            br#"[{"icao24":"abcdef","firstSeen":1705276800,"lastSeen":1705280400,"estDepartureAirport":"KAPA","estArrivalAirport":"KJFK"}]"#,
+        )
+        .unwrap();
+        let mut db = JournalDb::open(&journal).unwrap();
+        let fleet = crate::fleet::FleetQuery {
+            rows: vec![fleet_row("abcdef")],
+            skipped_empty_icao24: 0,
+            snapshot_as_of: "2026-08-31".into(),
+        };
+        db.replace_fleet_snapshot(&fleet.rows, &fleet.snapshot_as_of)
+            .unwrap();
+        let fake = FakeOpensky {
+            flights_payload: flights,
+            flights_http: std::sync::atomic::AtomicU32::new(0),
+            fail_on_flights_http: None,
+            tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            tracks_http: std::sync::atomic::AtomicU32::new(0),
+        };
+        let mut opts = collect_opts(&cache, &journal, date, Vec::new(), false);
+        opts.min_flights_all_slice_n = 2_000;
+        let r = collect_opensky_with(&fake, &opts, fleet, db, test_airports())
+            .await
+            .unwrap();
+        assert_eq!(r.flights_calls, 12);
+        assert_eq!(r.trips_upserted, 0);
+        assert!(!flights_all_slice_cache_path(&cache, date, 0).exists());
+        let db = JournalDb::open(&journal).unwrap();
+        assert!(!db.flights_all_slice_complete(date, 0).unwrap());
+        assert!(db.flights_all_slice_complete(date, 1).unwrap());
+        assert!(!db.flights_all_day_complete(date, 12).unwrap());
+        let st = db.status(&journal).unwrap();
+        assert!(
+            st.flights_all_errors
+                .iter()
+                .any(|(_, e)| e.contains("flights/all thin")),
+            "{:?}",
+            st.flights_all_errors
+        );
     }
 }
