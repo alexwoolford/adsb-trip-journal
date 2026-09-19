@@ -71,6 +71,7 @@ pub struct JournalStatus {
     pub trips: i64,
     pub flights_all_complete_max: Option<String>,
     pub flights_all_incomplete: Vec<(String, i64)>,
+    pub flights_all_empty_locked: Vec<String>,
     pub flights_all_errors: Vec<(String, String)>,
 }
 
@@ -604,6 +605,25 @@ impl JournalDb {
         let flights_all_incomplete = inc_stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut complete_stmt = self.conn.prepare(
+            r#"
+            SELECT utc_date FROM flights_all_slice
+            GROUP BY utc_date
+            HAVING COUNT(*) >= 12
+            ORDER BY utc_date
+            "#,
+        )?;
+        let complete_dates = complete_stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut flights_all_empty_locked = Vec::new();
+        for s in complete_dates {
+            let d = NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                .with_context(|| format!("flights_all_slice utc_date {s}"))?;
+            if self.count_trips_on_day(d)? == 0 {
+                flights_all_empty_locked.push(s);
+            }
+        }
         let mut err_stmt = self.conn.prepare(
             r#"
             SELECT utc_date, last_error FROM flights_all_day
@@ -622,6 +642,7 @@ impl JournalDb {
             trips,
             flights_all_complete_max,
             flights_all_incomplete,
+            flights_all_empty_locked,
             flights_all_errors,
         })
     }
@@ -1154,6 +1175,33 @@ mod tests {
             db.mark_flights_all_slice_ok(d, i).unwrap();
         }
         assert!(db.flights_all_day_complete(d, 12).unwrap());
+    }
+
+    #[test]
+    fn status_lists_empty_locked_12_of_12_with_zero_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let db = JournalDb::open(&path).unwrap();
+        let empty = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let with_trip = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+        for i in 0..12 {
+            db.mark_flights_all_slice_ok(empty, i).unwrap();
+            db.mark_flights_all_slice_ok(with_trip, i).unwrap();
+        }
+        db.upsert_trip(&trip_on(
+            "a12c04",
+            "N175CT",
+            "2026-09-06T12:00:00Z",
+            None,
+            Some(10),
+        ))
+        .unwrap();
+        let st = db.status(&path).unwrap();
+        assert_eq!(st.flights_all_empty_locked, vec!["2026-09-03".to_string()]);
+        assert!(!st
+            .flights_all_empty_locked
+            .iter()
+            .any(|d| d == "2026-09-06"));
     }
 
     #[test]

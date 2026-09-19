@@ -458,6 +458,7 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
     );
 
     let mut date = newest;
+    let mut tracks_exhausted = false;
     loop {
         if db.flights_all_day_complete(date, FLIGHTS_ALL_SLICES_PER_DAY)? {
             info!(%date, "flights/all day already complete");
@@ -485,7 +486,6 @@ async fn collect_opensky_with<C: OpenskyCollectApi>(
 
         let slices = utc_day_two_hour_slices(date);
         let mut halted = false;
-        let mut tracks_exhausted = false;
         for (slice_idx, (begin, end_ts)) in slices.into_iter().enumerate() {
             let slice_idx = slice_idx as u32;
             if db.flights_all_slice_complete(date, slice_idx)? {
@@ -725,6 +725,9 @@ pub fn print_status(status: &crate::store::JournalStatus, fleet: Option<&FleetQu
     for (d, n) in &status.flights_all_incomplete {
         println!("  flights_all in progress {d}: {n}/12 slices");
     }
+    for d in &status.flights_all_empty_locked {
+        println!("  flights_all empty-locked {d}: 12/12 slices, 0 trips");
+    }
     for (d, err) in &status.flights_all_errors {
         println!("  flights_all error {d}: {err}");
     }
@@ -932,6 +935,9 @@ mod tests {
         flights_payload: Vec<Flight>,
         flights_http: std::sync::atomic::AtomicU32,
         fail_on_flights_http: Option<u32>,
+        /// When true, every `/flights/all` GET returns `flights_payload` (needed
+        /// so a later UTC day still has legs that call `/tracks`).
+        repeat_flights_payload: bool,
         tracks: std::sync::Mutex<std::collections::VecDeque<OpenskyOutcome<Option<TrackEnds>>>>,
         tracks_http: std::sync::atomic::AtomicU32,
     }
@@ -964,7 +970,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
             let fail = self.fail_on_flights_http;
-            let data = if n == 1 {
+            let data = if n == 1 || self.repeat_flights_payload {
                 self.flights_payload.clone()
             } else {
                 Vec::new()
@@ -1026,6 +1032,7 @@ mod tests {
             flights_payload: Vec::new(),
             flights_http: std::sync::atomic::AtomicU32::new(0),
             fail_on_flights_http: Some(3),
+            repeat_flights_payload: false,
             tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tracks_http: std::sync::atomic::AtomicU32::new(0),
         };
@@ -1089,6 +1096,7 @@ mod tests {
             flights_payload: flights,
             flights_http: std::sync::atomic::AtomicU32::new(0),
             fail_on_flights_http: None,
+            repeat_flights_payload: false,
             tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tracks_http: std::sync::atomic::AtomicU32::new(0),
         };
@@ -1178,6 +1186,7 @@ mod tests {
             flights_payload: flights,
             flights_http: std::sync::atomic::AtomicU32::new(0),
             fail_on_flights_http: None,
+            repeat_flights_payload: false,
             tracks: std::sync::Mutex::new(script),
             tracks_http: std::sync::atomic::AtomicU32::new(0),
         };
@@ -1250,6 +1259,7 @@ mod tests {
             flights_payload: flights,
             flights_http: std::sync::atomic::AtomicU32::new(0),
             fail_on_flights_http: None,
+            repeat_flights_payload: false,
             tracks: std::sync::Mutex::new(script),
             tracks_http: std::sync::atomic::AtomicU32::new(0),
         };
@@ -1289,6 +1299,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_opensky_tracks_429_skips_tracks_on_later_dates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let journal = dir.path().join("trips.sqlite");
+        let older = NaiveDate::from_ymd_opt(2024, 1, 14).unwrap();
+        let newer = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let flights = crate::opensky::parse_flights(
+            br#"[{"icao24":"abcdef","firstSeen":1705276800,"lastSeen":1705280400}]"#,
+        )
+        .unwrap();
+        let mut script = std::collections::VecDeque::new();
+        script.push_back(OpenskyOutcome::RateLimited {
+            credit: tracks_credit(),
+        });
+        let mut db = JournalDb::open(&journal).unwrap();
+        let fleet = crate::fleet::FleetQuery {
+            rows: vec![fleet_row("abcdef")],
+            skipped_empty_icao24: 0,
+            snapshot_as_of: "2026-08-31".into(),
+        };
+        db.replace_fleet_snapshot(&fleet.rows, &fleet.snapshot_as_of)
+            .unwrap();
+        let fake = FakeOpensky {
+            flights_payload: flights,
+            flights_http: std::sync::atomic::AtomicU32::new(0),
+            fail_on_flights_http: None,
+            repeat_flights_payload: true,
+            tracks: std::sync::Mutex::new(script),
+            tracks_http: std::sync::atomic::AtomicU32::new(0),
+        };
+        let opts = collect_opts_range(
+            &cache,
+            &journal,
+            older,
+            newer,
+            2 * FLIGHTS_ALL_DAY_CREDITS,
+            Vec::new(),
+            true,
+        );
+        let r = collect_opensky_with(&fake, &opts, fleet, db, AirportIndex::empty())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.tracks_calls, 1,
+            "tracks 429 must not HTTP /tracks on a later UTC date"
+        );
+        assert_eq!(
+            r.flights_calls, 24,
+            "tracks 429 must still GET remaining /flights/all slices of both days"
+        );
+        let db = JournalDb::open(&journal).unwrap();
+        assert!(
+            !db.flights_all_slice_complete(newer, 0).unwrap(),
+            "newer date slice that 429'd must stay unmarked"
+        );
+        assert!(
+            !db.flights_all_slice_complete(older, 0).unwrap(),
+            "older date slices that needed tracks must stay unmarked"
+        );
+        assert!(!db.flights_all_day_complete(newer, 12).unwrap());
+        assert!(!db.flights_all_day_complete(older, 12).unwrap());
+    }
+
+    #[tokio::test]
     async fn collect_newest_first_does_not_start_unaffordable_older_day() {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
@@ -1307,6 +1381,7 @@ mod tests {
             flights_payload: Vec::new(),
             flights_http: std::sync::atomic::AtomicU32::new(0),
             fail_on_flights_http: None,
+            repeat_flights_payload: false,
             tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tracks_http: std::sync::atomic::AtomicU32::new(0),
         };
@@ -1355,6 +1430,7 @@ mod tests {
             flights_payload: Vec::new(),
             flights_http: std::sync::atomic::AtomicU32::new(0),
             fail_on_flights_http: None,
+            repeat_flights_payload: false,
             tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tracks_http: std::sync::atomic::AtomicU32::new(0),
         };
@@ -1398,6 +1474,7 @@ mod tests {
             flights_payload: flights,
             flights_http: std::sync::atomic::AtomicU32::new(0),
             fail_on_flights_http: None,
+            repeat_flights_payload: false,
             tracks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tracks_http: std::sync::atomic::AtomicU32::new(0),
         };
